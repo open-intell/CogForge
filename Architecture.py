@@ -13,27 +13,43 @@ Architecture:
   - RMSNorm throughout
   - Handoff Protocol for CogWorks swarm coordination
 
+CogSearch: Execution-Guided Monte Carlo Tree Search
+  - UCT-based node selection (exploitation vs exploration)
+  - Multi-branch expansion via ProblemSolver
+  - Two-level evaluation: VerifierHead (internal) + TerminalGuy (external)
+  - Reward: -1.0 syntax error | 0.1 logic flaw | 1.0 passes tests
+  - Backpropagation through code-state tree
+  - DPO pair collection: (prompt, winning_code, losing_code)
+
 CogWorks Swarm Agents:
   - Coordinator    : Overseer, task routing, quality gates
   - Dreamer        : Hierarchical memory management and consolidation
-  - Explorer       : Repository mapping and flagging
+  - Explorer       : Repository mapping and flagging (CPG-aware)
   - Planner        : Task decomposition into DAGs
-  - ProblemSolver  : Deep expert reasoning
+  - ProblemSolver  : Deep expert reasoning (drives MCTS expansion)
   - Engineer       : Code efficiency and clean-form refactoring
   - BugFinder      : Deep inspection and logical error hunting
-  - TerminalGuy    : Sandboxed tool/command executor
+  - TerminalGuy    : Sandboxed tool/command executor (MCTS oracle)
   - VulnerabilityFinder : Security specialist
-  - Pessimist      : Devil's advocate, stress-tester
+  - Pessimist      : Devil's advocate, stress-tester (MCTS reward signal)
   - Documentor     : Comments, docstrings, READMEs
+  - Nexus          : Dependency & API specialist, RAG over docs
+  - Archeologist   : Git history & intent analyst, temporal latent map
 """
 
 import ast
+import hashlib
+import importlib.metadata
 import json
 import math
 import os
 import re
 import subprocess
+import sys
+import tempfile
 import textwrap
+import time
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -1037,6 +1053,8 @@ AGENT_NAMES: List[str] = [
     "VulnerabilityFinder",
     "Pessimist",
     "Documentor",
+    "Nexus",
+    "Archeologist",
 ]
 
 
@@ -2303,6 +2321,1204 @@ class Documentor(BaseAgent):
 
 
 # ===========================================================================
+# 12. Nexus  —  Dependency & API Specialist
+# ===========================================================================
+
+class Nexus(BaseAgent):
+    """
+    Manages the 'external world' of a codebase: dependencies, package versions,
+    and API documentation.  Sits between Explorer and Engineer to prevent
+    hallucinated library calls.
+
+    Core capabilities:
+      - Parse requirements.txt / pyproject.toml / package.json and resolve
+        installed vs declared versions.
+      - Detect import statements in source and cross-reference them against
+        known-installed packages (via importlib.metadata).
+      - Fetch abbreviated PyPI JSON metadata to verify a package exists and
+        retrieve its latest stable version (no heavy HTTP library needed).
+      - Build a local RAG cache: package → {version, summary, top_symbols}.
+        ProblemSolver / Engineer query this before writing any library call.
+      - Flag deprecated or non-existent symbols by comparing against the
+        cached API surface.
+    """
+
+    role = "Nexus"
+
+    # Packages that are stdlib and should never be flagged as missing.
+    _STDLIB = frozenset(sys.stdlib_module_names) if hasattr(sys, "stdlib_module_names") else frozenset()
+
+    # Simple symbol blocklist: (package, bad_symbol, replacement)
+    _DEPRECATED: List[Tuple[str, str, str]] = [
+        ("pandas",  "DataFrame.append",   "pd.concat([df, new_row], ignore_index=True)"),
+        ("sklearn", "cross_val_predict",  "cross_val_score (check docs for correct usage)"),
+        ("flask",   "before_first_request","teardown_appcontext or app-factory pattern"),
+        ("django",  "url(",               "path( / re_path("),
+        ("numpy",   "np.bool",            "np.bool_"),
+        ("numpy",   "np.int",             "np.int_"),
+        ("numpy",   "np.float",           "np.float_"),
+        ("numpy",   "np.complex",         "np.complex_"),
+        ("requests","requests.get(verify=False", "provide CA bundle; never disable SSL"),
+    ]
+
+    # ── Requirements parsing ─────────────────────────────────────────────────
+
+    def _parse_requirements(self, root: str) -> Dict[str, str]:
+        """
+        Return {package_name: version_spec} from requirements.txt or
+        pyproject.toml (dependencies table) found under root.
+        """
+        declared: Dict[str, str] = {}
+
+        req_path = os.path.join(root, "requirements.txt")
+        if os.path.isfile(req_path):
+            try:
+                with open(req_path, encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        # e.g. "pandas>=1.3,<2.0" or "flask==2.3.2"
+                        m = re.match(r"^([A-Za-z0-9_\-\.]+)\s*([^;#]*)", line)
+                        if m:
+                            declared[m.group(1).lower()] = m.group(2).strip()
+            except OSError:
+                pass
+
+        pyproject_path = os.path.join(root, "pyproject.toml")
+        if os.path.isfile(pyproject_path):
+            try:
+                with open(pyproject_path, encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                # Very lightweight TOML parse — extract [project] dependencies
+                in_deps = False
+                for line in content.splitlines():
+                    if re.match(r"\[project\.dependencies\]|\[tool\.poetry\.dependencies\]", line):
+                        in_deps = True
+                        continue
+                    if in_deps:
+                        if line.startswith("["):
+                            in_deps = False
+                            continue
+                        m = re.match(r'^"?([A-Za-z0-9_\-\.]+)"?\s*[=:]\s*"?([^"#\n]*)"?', line)
+                        if m:
+                            declared[m.group(1).lower()] = m.group(2).strip()
+            except OSError:
+                pass
+
+        return declared
+
+    def _parse_package_json(self, root: str) -> Dict[str, str]:
+        """Return {package: version} from package.json if present."""
+        pkg_path = os.path.join(root, "package.json")
+        if not os.path.isfile(pkg_path):
+            return {}
+        try:
+            with open(pkg_path, encoding="utf-8") as f:
+                data = json.load(f)
+            deps: Dict[str, str] = {}
+            deps.update(data.get("dependencies", {}))
+            deps.update(data.get("devDependencies", {}))
+            return deps
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    # ── Installed package resolution ─────────────────────────────────────────
+
+    def _installed_packages(self) -> Dict[str, str]:
+        """Return {name: version} for all packages visible to importlib.metadata."""
+        installed: Dict[str, str] = {}
+        try:
+            for dist in importlib.metadata.distributions():
+                name = dist.metadata.get("Name", "").lower()
+                version = dist.metadata.get("Version", "unknown")
+                if name:
+                    installed[name] = version
+        except Exception:
+            pass
+        return installed
+
+    # ── PyPI metadata fetch ──────────────────────────────────────────────────
+
+    def _pypi_info(self, package: str, timeout: int = 4) -> Optional[Dict]:
+        """
+        Fetch minimal PyPI JSON for *package*.  Returns dict with keys:
+          {name, latest_version, summary, requires_python, home_page}
+        or None if the package doesn't exist / network unavailable.
+        """
+        url = f"https://pypi.org/pypi/{package}/json"
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode())
+            info = data.get("info", {})
+            return {
+                "name":             info.get("name", package),
+                "latest_version":   info.get("version", "?"),
+                "summary":          info.get("summary", "")[:200],
+                "requires_python":  info.get("requires_python", "any"),
+                "home_page":        info.get("home_page", ""),
+            }
+        except Exception:
+            return None
+
+    # ── Import scanner ───────────────────────────────────────────────────────
+
+    def _extract_imports(self, source: str) -> List[str]:
+        """Return list of top-level imported package names from Python source."""
+        packages: List[str] = []
+        try:
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        packages.append(alias.name.split(".")[0])
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        packages.append(node.module.split(".")[0])
+        except SyntaxError:
+            # Fallback regex for files with syntax errors
+            for m in re.finditer(r"^(?:import|from)\s+([A-Za-z0-9_]+)", source, re.MULTILINE):
+                packages.append(m.group(1))
+        return list(set(packages))
+
+    # ── Deprecation scanner ──────────────────────────────────────────────────
+
+    def _scan_deprecated_symbols(self, source: str) -> List[Dict]:
+        """Check source for known deprecated / removed API calls."""
+        issues: List[Dict] = []
+        for pkg, bad_symbol, replacement in self._DEPRECATED:
+            if bad_symbol in source:
+                issues.append({
+                    "package":     pkg,
+                    "bad_symbol":  bad_symbol,
+                    "replacement": replacement,
+                    "severity":    "warning",
+                })
+        return issues
+
+    # ── RAG cache builder ────────────────────────────────────────────────────
+
+    def _build_rag_entry(self, package: str, installed: Dict[str, str]) -> Dict:
+        """
+        Build a RAG cache entry for a package.
+        Prefers locally installed metadata, falls back to PyPI.
+        """
+        entry: Dict[str, Any] = {"package": package, "source": "unknown"}
+        if package in installed:
+            entry["installed_version"] = installed[package]
+            entry["source"] = "local"
+            try:
+                dist = importlib.metadata.distribution(package)
+                entry["summary"] = dist.metadata.get("Summary", "")[:200]
+                entry["home_page"] = dist.metadata.get("Home-page", "")
+                # Extract top-level public symbols if package is importable
+                try:
+                    mod = __import__(package)
+                    entry["top_symbols"] = [
+                        s for s in dir(mod) if not s.startswith("_")
+                    ][:40]
+                except Exception:
+                    entry["top_symbols"] = []
+            except Exception:
+                pass
+        else:
+            # Package not installed locally; try PyPI
+            pypi = self._pypi_info(package)
+            if pypi:
+                entry.update(pypi)
+                entry["source"] = "pypi"
+                entry["installed_version"] = None
+            else:
+                entry["source"] = "not_found"
+        return entry
+
+    # ── Main run ─────────────────────────────────────────────────────────────
+
+    def run(self, task: str, root: str = ".", **kwargs) -> HandoffMessage:
+        """
+        Full Nexus pipeline:
+          1. Parse declared dependencies (requirements.txt / pyproject.toml / package.json).
+          2. Resolve installed packages.
+          3. Compare declared vs installed; flag mismatches.
+          4. Scan all Python source imports; build RAG cache entries.
+          5. Scan for deprecated symbol usage.
+          6. Emit findings + RAG cache to shared memory.
+        """
+        declared_py  = self._parse_requirements(root)
+        declared_js  = self._parse_package_json(root)
+        installed    = self._installed_packages()
+
+        # ── Declared vs installed mismatch ──────────────────────────────────
+        missing_from_env: List[str] = []
+        version_flags: List[Dict]   = []
+        for pkg, spec in declared_py.items():
+            if pkg in self._STDLIB:
+                continue
+            if pkg not in installed:
+                missing_from_env.append(pkg)
+            else:
+                # Rough check: if spec starts with ==, compare exact version
+                m = re.match(r"==\s*([^\s,]+)", spec)
+                if m:
+                    declared_ver = m.group(1).strip()
+                    inst_ver = installed[pkg]
+                    if declared_ver != inst_ver:
+                        version_flags.append({
+                            "package": pkg,
+                            "declared": declared_ver,
+                            "installed": inst_ver,
+                        })
+
+        # ── Walk source files and gather imports ─────────────────────────────
+        repo_map  = self.memory.get_repo_map()
+        all_imports: Dict[str, List[str]] = {}   # file → [packages]
+        deprecated_issues: List[Dict]     = []
+
+        py_files = list(repo_map.keys()) if repo_map else []
+        if not py_files:
+            for dirpath, _, filenames in os.walk(root):
+                for fn in filenames:
+                    if fn.endswith(".py"):
+                        py_files.append(os.path.join(dirpath, fn))
+
+        for filepath in py_files:
+            try:
+                with open(filepath, encoding="utf-8", errors="ignore") as f:
+                    source = f.read()
+            except OSError:
+                continue
+            imports = self._extract_imports(source)
+            all_imports[filepath] = imports
+            depr = self._scan_deprecated_symbols(source)
+            for d in depr:
+                d["file"] = filepath
+            deprecated_issues.extend(depr)
+
+        # ── Build RAG cache for all unique imported packages ─────────────────
+        all_pkg_names: set = set()
+        for pkgs in all_imports.values():
+            all_pkg_names.update(pkgs)
+        # Remove stdlib
+        all_pkg_names = {p for p in all_pkg_names if p not in self._STDLIB}
+
+        rag_cache: Dict[str, Dict] = {}
+        for pkg in sorted(all_pkg_names):
+            rag_cache[pkg] = self._build_rag_entry(pkg, installed)
+
+        # Store in shared memory so ProblemSolver / Engineer can query it
+        self.memory.set("nexus_rag_cache", rag_cache)
+        self.memory.set("nexus_declared_py", declared_py)
+        self.memory.set("nexus_deprecated_issues", deprecated_issues)
+        self.memory.set("nexus_missing_from_env", missing_from_env)
+
+        # Hallucinated (not found on PyPI or locally): not_found entries
+        hallucinated = [p for p, info in rag_cache.items()
+                        if info.get("source") == "not_found"]
+
+        summary_parts = [
+            f"Dependency audit complete.",
+            f"Declared (py): {len(declared_py)} | Declared (js): {len(declared_js)}",
+            f"Missing from env: {missing_from_env or 'none'}",
+            f"Version mismatches: {len(version_flags)}",
+            f"Deprecated symbol uses: {len(deprecated_issues)}",
+            f"Potentially hallucinated packages: {hallucinated or 'none'}",
+            f"RAG cache entries: {len(rag_cache)}",
+        ]
+
+        # Forward critical findings to Engineer and Coordinator
+        if hallucinated or deprecated_issues:
+            self.emit(
+                target="Engineer",
+                message=(f"Nexus found {len(hallucinated)} potentially hallucinated packages "
+                         f"and {len(deprecated_issues)} deprecated API usages. Fix before shipping."),
+                artifacts={
+                    "hallucinated_packages":  hallucinated,
+                    "deprecated_issues":      deprecated_issues,
+                    "version_mismatches":     version_flags,
+                },
+            )
+
+        confidence = max(0.2, 1.0 - 0.05 * len(hallucinated) - 0.02 * len(deprecated_issues))
+        return self.emit(
+            target="Coordinator",
+            message="\n".join(summary_parts),
+            artifacts={
+                "rag_cache":              rag_cache,
+                "missing_from_env":       missing_from_env,
+                "hallucinated_packages":  hallucinated,
+                "deprecated_issues":      deprecated_issues,
+                "version_mismatches":     version_flags,
+                "declared_js":            declared_js,
+            },
+            confidence=confidence,
+            status="done",
+        )
+
+    def query_api(self, package: str, symbol: str = "") -> Dict:
+        """
+        Convenience method for other agents to query the RAG cache at runtime.
+        Returns the cache entry for *package*, with an optional symbol check.
+
+        Usage:
+            nexus.query_api("pandas", "DataFrame.merge")
+        """
+        cache: Dict[str, Dict] = self.memory.get("nexus_rag_cache") or {}
+        entry = cache.get(package.lower(), {})
+        result = dict(entry)
+        if symbol and "top_symbols" in entry:
+            sym_base = symbol.split(".")[0]
+            result["symbol_found"] = sym_base in entry["top_symbols"]
+        elif symbol:
+            result["symbol_found"] = None   # unknown — needs deeper inspection
+        return result
+
+
+# ===========================================================================
+# 13. Archeologist  —  Git History & Intent Analyst
+# ===========================================================================
+
+class Archeologist(BaseAgent):
+    """
+    Transforms raw Git history into a *Temporal Latent Map*: a structured
+    understanding of WHY each piece of code exists, not just what it does.
+
+    Before Engineer refactors anything, Archeologist flags:
+      - Code added to fix a specific production bug (touch-carefully zone).
+      - Hot-fix files (committed frequently in recent months → volatile).
+      - Stale legacy code untouched for > STALE_DAYS (candidate for removal).
+      - Large commits that swept many files (risky blast-radius refactors).
+      - Commit messages that reference known patterns: "fix race", "hotfix",
+        "revert", "security", "CVE" → extra caution flags.
+
+    Builds its map using pure subprocess calls to git; no external library
+    required.  Degrades gracefully if the repo has no git history.
+    """
+
+    role = "Archeologist"
+    STALE_DAYS       = 730    # 2 years
+    HOT_FIX_COMMITS  = 5      # if a file has this many commits in 90 days → volatile
+    LARGE_COMMIT_FILES = 20   # commits touching > this many files are flagged
+
+    # Commit message patterns that warrant extra caution
+    _CAUTION_PATTERNS: List[Tuple[str, str]] = [
+        (r"\b(hotfix|hot[- ]fix)\b",           "hotfix"),
+        (r"\b(race condition|mutex|lock)\b",    "concurrency-fix"),
+        (r"\b(revert|rollback)\b",              "revert"),
+        (r"\b(security|CVE-\d+|vuln|exploit)\b","security-patch"),
+        (r"\b(performance|perf|slow|N\+1)\b",   "perf-fix"),
+        (r"\b(memory leak|OOM|oom)\b",          "memory-fix"),
+        (r"\b(migration|migrate)\b",            "migration"),
+        (r"\bWIP\b",                            "work-in-progress"),
+    ]
+
+    # ── Git helpers ──────────────────────────────────────────────────────────
+
+    def _git(self, args: List[str], cwd: str, timeout: int = 15) -> str:
+        """Run a git command; return stdout as string, empty on error."""
+        try:
+            result = subprocess.run(
+                ["git"] + args,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return ""
+
+    def _has_git(self, root: str) -> bool:
+        out = self._git(["rev-parse", "--git-dir"], root)
+        return bool(out)
+
+    def _log_for_file(self, filepath: str, root: str) -> List[Dict]:
+        """
+        Return list of commit records for a single file:
+          {hash, author, date_iso, subject, files_changed}
+        Uses --follow to track renames.
+        """
+        sep = "|||"
+        fmt = f"%H{sep}%ae{sep}%ci{sep}%s"
+        out = self._git(
+            ["log", "--follow", f"--pretty=format:{fmt}", "--", filepath],
+            cwd=root,
+        )
+        if not out:
+            return []
+
+        records: List[Dict] = []
+        for line in out.splitlines():
+            parts = line.split(sep)
+            if len(parts) < 4:
+                continue
+            commit_hash, author, date_iso, subject = parts[0], parts[1], parts[2], parts[3]
+            # Count files changed in this commit
+            stat_out = self._git(
+                ["diff-tree", "--no-commit-id", "-r", "--name-only", commit_hash],
+                cwd=root,
+            )
+            files_in_commit = [l for l in stat_out.splitlines() if l.strip()]
+            records.append({
+                "hash":          commit_hash[:12],
+                "author":        author,
+                "date_iso":      date_iso.strip(),
+                "subject":       subject.strip(),
+                "files_changed": len(files_in_commit),
+            })
+        return records
+
+    def _parse_date(self, date_iso: str) -> Optional[float]:
+        """Parse ISO date string to POSIX timestamp; return None on failure."""
+        # Format: "2024-03-15 14:22:01 +0000"
+        try:
+            import email.utils
+            # Strip timezone offset and parse naive
+            date_part = date_iso.rsplit(" ", 1)[0]  # remove tz
+            import datetime
+            dt = datetime.datetime.strptime(date_part, "%Y-%m-%d %H:%M:%S")
+            return dt.timestamp()
+        except Exception:
+            return None
+
+    # ── Analysis ─────────────────────────────────────────────────────────────
+
+    def _classify_file(self, filepath: str, commits: List[Dict]) -> Dict:
+        """
+        Produce a temporal classification for a single file given its commits.
+        Returns a dict with keys:
+          age_days, last_touched_days_ago, commit_count, volatile, stale,
+          caution_flags, caution_reasons, large_commit_hashes,
+          hotfix_subjects, recommendation
+        """
+        now = time.time()
+        if not commits:
+            return {
+                "age_days": None, "last_touched_days_ago": None,
+                "commit_count": 0, "volatile": False, "stale": True,
+                "caution_flags": [], "caution_reasons": [],
+                "large_commit_hashes": [], "hotfix_subjects": [],
+                "recommendation": "no-git-history",
+            }
+
+        # Oldest commit = creation date
+        timestamps = [self._parse_date(c["date_iso"]) for c in commits]
+        timestamps = [t for t in timestamps if t is not None]
+
+        if timestamps:
+            first_ts = min(timestamps)
+            last_ts  = max(timestamps)
+            age_days            = (now - first_ts) / 86400
+            last_touched_days_ago = (now - last_ts) / 86400
+        else:
+            age_days = last_touched_days_ago = None
+
+        # Hot-fix volatility: commits in last 90 days
+        ninety_days_ago = now - 90 * 86400
+        recent_commits = [
+            c for c, t in zip(commits, timestamps)
+            if t and t > ninety_days_ago
+        ] if timestamps else []
+        volatile = len(recent_commits) >= self.HOT_FIX_COMMITS
+
+        stale = (last_touched_days_ago is not None
+                 and last_touched_days_ago > self.STALE_DAYS)
+
+        # Caution flags from commit messages
+        caution_flags: List[str]   = []
+        caution_reasons: List[str] = []
+        hotfix_subjects: List[str] = []
+        for commit in commits:
+            subj = commit["subject"].lower()
+            for pattern, label in self._CAUTION_PATTERNS:
+                if re.search(pattern, subj, re.IGNORECASE):
+                    if label not in caution_flags:
+                        caution_flags.append(label)
+                    caution_reasons.append(
+                        f"[{commit['hash']}] {label}: {commit['subject'][:80]}"
+                    )
+                    if label == "hotfix":
+                        hotfix_subjects.append(commit["subject"][:100])
+
+        # Large commit sweep detection
+        large_commit_hashes = [
+            c["hash"] for c in commits
+            if c["files_changed"] >= self.LARGE_COMMIT_FILES
+        ]
+
+        # Build recommendation
+        rec_parts: List[str] = []
+        if volatile:
+            rec_parts.append("VOLATILE: high recent change rate — test thoroughly after any edit")
+        if stale:
+            rec_parts.append("STALE: untouched for 2+ years — check if still needed")
+        if caution_flags:
+            rec_parts.append(f"CAUTION-FLAGS: {', '.join(caution_flags)}")
+        if large_commit_hashes:
+            rec_parts.append(f"BLAST-RADIUS: was part of large sweeping commits {large_commit_hashes[:3]}")
+        recommendation = " | ".join(rec_parts) if rec_parts else "safe-to-refactor"
+
+        return {
+            "age_days":             round(age_days, 1) if age_days else None,
+            "last_touched_days_ago": round(last_touched_days_ago, 1) if last_touched_days_ago else None,
+            "commit_count":         len(commits),
+            "volatile":             volatile,
+            "stale":                stale,
+            "caution_flags":        caution_flags,
+            "caution_reasons":      caution_reasons[:5],    # top 5
+            "large_commit_hashes":  large_commit_hashes[:3],
+            "hotfix_subjects":      hotfix_subjects[:3],
+            "recommendation":       recommendation,
+        }
+
+    def _build_temporal_map(self, root: str, py_files: List[str]) -> Dict[str, Dict]:
+        """
+        For every file, fetch its git log and produce a classification.
+        Returns {filepath: classification_dict}.
+        """
+        temporal_map: Dict[str, Dict] = {}
+        for filepath in py_files:
+            rel = os.path.relpath(filepath, root)
+            commits = self._log_for_file(rel, root)
+            classification = self._classify_file(filepath, commits)
+            classification["commit_log"] = [
+                {"hash": c["hash"], "date": c["date_iso"][:10],
+                 "subject": c["subject"][:80]}
+                for c in commits[:10]
+            ]
+            temporal_map[filepath] = classification
+        return temporal_map
+
+    def _global_stats(self, root: str) -> Dict:
+        """
+        Repo-level statistics: total commits, active contributors,
+        most recently changed files, most frequently changed files.
+        """
+        # Total commits
+        total_str = self._git(["rev-list", "--count", "HEAD"], root)
+        total_commits = int(total_str) if total_str.isdigit() else 0
+
+        # Active contributors (last 90 days)
+        contrib_out = self._git(
+            ["shortlog", "-sn", "--since=90.days.ago", "HEAD"],
+            root,
+        )
+        contributors = []
+        for line in contrib_out.splitlines():
+            m = re.match(r"\s*(\d+)\s+(.+)", line)
+            if m:
+                contributors.append({"commits": int(m.group(1)), "name": m.group(2)})
+
+        # Most frequently changed files (all time top 10)
+        freq_out = self._git(
+            ["log", "--name-only", "--pretty=format:", "HEAD"],
+            root,
+        )
+        freq_counter: Dict[str, int] = {}
+        for line in freq_out.splitlines():
+            line = line.strip()
+            if line and not line.startswith(" "):
+                freq_counter[line] = freq_counter.get(line, 0) + 1
+        most_changed = sorted(freq_counter.items(), key=lambda x: -x[1])[:10]
+
+        return {
+            "total_commits":     total_commits,
+            "active_contributors": contributors[:10],
+            "most_changed_files": [
+                {"file": f, "changes": c} for f, c in most_changed
+            ],
+        }
+
+    # ── Main run ─────────────────────────────────────────────────────────────
+
+    def run(self, task: str, root: str = ".", **kwargs) -> HandoffMessage:
+        """
+        Full Archeologist pipeline:
+          1. Check for git presence.
+          2. Build temporal map (per-file classification).
+          3. Compute global repo stats.
+          4. Identify touch-carefully zones and stale zones.
+          5. Emit temporal map to shared memory; forward caution zones to Engineer.
+        """
+        if not self._has_git(root):
+            return self.emit(
+                target="Coordinator",
+                message="No git repository found. Archeologist skipped.",
+                artifacts={"has_git": False},
+                confidence=0.5,
+                status="done",
+            )
+
+        # Collect python files from shared repo map or walk fresh
+        repo_map = self.memory.get_repo_map()
+        py_files = list(repo_map.keys()) if repo_map else []
+        if not py_files:
+            for dirpath, _, filenames in os.walk(root):
+                for fn in filenames:
+                    if fn.endswith(".py"):
+                        py_files.append(os.path.join(dirpath, fn))
+
+        temporal_map = self._build_temporal_map(root, py_files)
+        global_stats = self._global_stats(root)
+
+        # Identify caution zones
+        volatile_files = [
+            fp for fp, info in temporal_map.items() if info.get("volatile")
+        ]
+        caution_files = [
+            fp for fp, info in temporal_map.items()
+            if info.get("caution_flags")
+        ]
+        stale_files = [
+            fp for fp, info in temporal_map.items()
+            if info.get("stale") and not info.get("volatile")
+        ]
+
+        # Write temporal map into shared memory so Engineer / Planner can read
+        self.memory.set("temporal_map", temporal_map)
+        self.memory.set("archeologist_global_stats", global_stats)
+
+        # Annotate repo_map with temporal data
+        for fp, info in temporal_map.items():
+            existing = self.memory.get_repo_map().get(fp, {})
+            existing["temporal"] = {
+                "volatile":      info["volatile"],
+                "stale":         info["stale"],
+                "caution_flags": info["caution_flags"],
+                "recommendation": info["recommendation"],
+                "last_touched_days_ago": info["last_touched_days_ago"],
+            }
+            self.memory.update_repo_map(fp, existing)
+
+        # Forward volatile + caution files to Engineer with context
+        if volatile_files or caution_files:
+            caution_context = {}
+            for fp in set(volatile_files + caution_files):
+                info = temporal_map[fp]
+                caution_context[fp] = {
+                    "recommendation": info["recommendation"],
+                    "caution_reasons": info["caution_reasons"],
+                    "hotfix_subjects": info["hotfix_subjects"],
+                }
+            self.emit(
+                target="Engineer",
+                message=(
+                    f"Archeologist flagged {len(volatile_files)} volatile files and "
+                    f"{len(caution_files)} caution-zone files. "
+                    "Do NOT simplify hotfix-tagged code without understanding the original bug."
+                ),
+                artifacts={"caution_context": caution_context},
+            )
+
+        # Forward stale files to Engineer and Documentor as cleanup candidates
+        if stale_files:
+            self.emit(
+                target="Documentor",
+                message=(
+                    f"{len(stale_files)} files untouched for 2+ years. "
+                    "Mark with deprecation notices where appropriate."
+                ),
+                artifacts={"stale_files": stale_files[:20]},
+            )
+
+        summary = (
+            f"Temporal map built for {len(py_files)} files. "
+            f"Volatile: {len(volatile_files)} | Caution: {len(caution_files)} | Stale: {len(stale_files)}. "
+            f"Repo has {global_stats['total_commits']} total commits, "
+            f"{len(global_stats['active_contributors'])} active contributors (last 90d)."
+        )
+
+        confidence = max(0.3, 1.0 - 0.04 * len(volatile_files) - 0.02 * len(caution_files))
+        return self.emit(
+            target="Coordinator",
+            message=summary,
+            artifacts={
+                "temporal_map":    {fp: v for fp, v in list(temporal_map.items())[:20]},
+                "global_stats":    global_stats,
+                "volatile_files":  volatile_files,
+                "caution_files":   caution_files,
+                "stale_files":     stale_files[:20],
+            },
+            confidence=confidence,
+            status="done",
+        )
+
+    def explain_file(self, filepath: str) -> str:
+        """
+        Convenience method: return a human-readable intent summary for a single
+        file, drawn from the temporal map already stored in shared memory.
+
+        Usage (e.g. from Engineer before refactoring):
+            context = swarm.archeologist.explain_file("auth/views.py")
+        """
+        temporal_map: Dict[str, Dict] = self.memory.get("temporal_map") or {}
+        info = temporal_map.get(filepath)
+        if not info:
+            return f"No temporal data for {filepath}. Run Archeologist first."
+
+        lines = [f"=== Archeologist report: {filepath} ==="]
+        lines.append(f"  Age: {info.get('age_days', '?')} days since first commit")
+        lines.append(f"  Last touched: {info.get('last_touched_days_ago', '?')} days ago")
+        lines.append(f"  Commits: {info.get('commit_count', 0)}")
+        lines.append(f"  Volatile: {info.get('volatile', False)} | Stale: {info.get('stale', False)}")
+        lines.append(f"  Recommendation: {info.get('recommendation', 'unknown')}")
+        if info.get("caution_reasons"):
+            lines.append("  Caution history:")
+            for reason in info["caution_reasons"]:
+                lines.append(f"    • {reason}")
+        if info.get("hotfix_subjects"):
+            lines.append("  Hotfix commits (do not simplify without reading):")
+            for subj in info["hotfix_subjects"]:
+                lines.append(f"    ⚠ {subj}")
+        return "\n".join(lines)
+
+
+# ===========================================================================
+# CogSearch  —  Execution-Guided Monte Carlo Tree Search
+# ===========================================================================
+
+@dataclass
+class MCTSNode:
+    """
+    A single node in the CogSearch tree.
+    Each node represents a code state: a partial or complete code snippet
+    plus the number of times it has been visited and its accumulated reward.
+    """
+    code:          str
+    parent:        Optional["MCTSNode"] = field(default=None, repr=False)
+    children:      List["MCTSNode"]    = field(default_factory=list, repr=False)
+    visits:        int   = 0
+    total_reward:  float = 0.0
+    depth:         int   = 0
+    expansion_prompt: str = ""   # the prompt fragment that generated this code
+    terminal:      bool  = False  # True if this node produced passing code
+
+    @property
+    def mean_reward(self) -> float:
+        return self.total_reward / max(self.visits, 1)
+
+    def uct(self, exploration_c: float = 1.414) -> float:
+        """
+        Upper Confidence bound applied to Trees (UCT).
+        UCT = W_i/N_i  +  c * sqrt(ln(N_parent) / N_i)
+
+        If this node has never been visited, return +inf (always explore first).
+        """
+        if self.visits == 0:
+            return float("inf")
+        parent_visits = self.parent.visits if self.parent else 1
+        exploit = self.mean_reward
+        explore  = exploration_c * math.sqrt(math.log(max(parent_visits, 1)) / self.visits)
+        return exploit + explore
+
+    def is_leaf(self) -> bool:
+        return len(self.children) == 0
+
+
+class CogSearch:
+    """
+    Execution-Guided Monte Carlo Tree Search engine for CogForge.
+
+    Wraps the ProblemSolver (expansion), VerifierHead (internal scoring),
+    TerminalGuy (external execution), and Pessimist (logic-flaw detection)
+    into a principled MCTS loop.
+
+    Algorithm (per iteration):
+      1. Selection   — descend tree via UCT until a leaf node is reached.
+      2. Expansion   — ProblemSolver generates K candidate next-step fragments.
+      3. Evaluation  — Level-1: VerifierHead score.  Level-2: py_compile / pytest.
+      4. Reward      — syntax error → -1.0 | logic flaw → 0.1 | passes tests → 1.0
+      5. Backprop    — propagate reward up through all ancestor nodes.
+
+    After all iterations, returns the highest-reward leaf (best code path) plus
+    a list of DPO pairs: (prompt, winning_code, losing_code) for training.
+    """
+
+    # Reward constants
+    REWARD_SYNTAX_ERROR   = -1.0
+    REWARD_LOGIC_FLAW     =  0.1
+    REWARD_COMPILES_CLEAN =  0.5
+    REWARD_PASSES_TESTS   =  1.0
+
+    def __init__(
+        self,
+        problem_solver: "ProblemSolver",
+        terminal_guy:   "TerminalGuy",
+        pessimist:      "Pessimist",
+        model:          Optional["CogForge"] = None,
+        exploration_c:  float = 1.414,
+        k_expansions:   int   = 3,
+        verifier_threshold: float = 0.3,
+    ):
+        self.problem_solver      = problem_solver
+        self.terminal_guy        = terminal_guy
+        self.pessimist           = pessimist
+        self.model               = model
+        self.exploration_c       = exploration_c
+        self.k_expansions        = k_expansions
+        self.verifier_threshold  = verifier_threshold
+        self._dpo_pairs: List[Dict] = []   # accumulated DPO training pairs
+
+    # ── Tree operations ──────────────────────────────────────────────────────
+
+    def _select(self, root: MCTSNode) -> MCTSNode:
+        """
+        Descend from root, always choosing the child with the highest UCT score,
+        until a leaf (unexpanded) node is reached.
+        """
+        node = root
+        while not node.is_leaf():
+            node = max(node.children, key=lambda n: n.uct(self.exploration_c))
+        return node
+
+    def _expand(self, node: MCTSNode, prompt: str) -> List[MCTSNode]:
+        """
+        Ask ProblemSolver to generate K candidate code fragments that extend
+        the current node's code.  Returns a list of new child MCTSNodes.
+
+        The heuristic generator produces K stylistically different completions
+        (loop-based, comprehension-based, recursive) as code branch candidates.
+        When a real generative model is attached, the ProblemSolver would call
+        model.generate() here with nucleus sampling at varying temperatures.
+        """
+        base_code = node.code
+        children: List[MCTSNode] = []
+
+        # Heuristic expansion strategies (no generative model required)
+        strategies = [
+            ("iterative",    self._strategy_iterative),
+            ("functional",   self._strategy_functional),
+            ("recursive",    self._strategy_recursive),
+        ]
+
+        for i in range(min(self.k_expansions, len(strategies))):
+            strategy_name, strategy_fn = strategies[i % len(strategies)]
+            candidate_code = strategy_fn(base_code, prompt)
+            child = MCTSNode(
+                code=candidate_code,
+                parent=node,
+                depth=node.depth + 1,
+                expansion_prompt=f"{strategy_name}: {prompt[:60]}",
+            )
+            children.append(child)
+
+        node.children.extend(children)
+        return children
+
+    def _strategy_iterative(self, base: str, prompt: str) -> str:
+        """Generate an iterative (for-loop) style code fragment."""
+        func_name = re.sub(r"[^a-z0-9_]", "_", prompt.lower().split()[0][:20])
+        return (base + "\n" +
+                f"def {func_name}_iterative(items):\n"
+                f"    result = []\n"
+                f"    for item in items:\n"
+                f"        # TODO: implement {prompt[:40]}\n"
+                f"        result.append(item)\n"
+                f"    return result\n")
+
+    def _strategy_functional(self, base: str, prompt: str) -> str:
+        """Generate a functional (list-comprehension) style code fragment."""
+        func_name = re.sub(r"[^a-z0-9_]", "_", prompt.lower().split()[0][:20])
+        return (base + "\n" +
+                f"def {func_name}_functional(items):\n"
+                f"    # Functional approach: {prompt[:60]}\n"
+                f"    return [item for item in items if item is not None]\n")
+
+    def _strategy_recursive(self, base: str, prompt: str) -> str:
+        """Generate a recursive style code fragment."""
+        func_name = re.sub(r"[^a-z0-9_]", "_", prompt.lower().split()[0][:20])
+        return (base + "\n" +
+                f"def {func_name}_recursive(items, acc=None):\n"
+                f"    if acc is None:\n"
+                f"        acc = []\n"
+                f"    if not items:\n"
+                f"        return acc\n"
+                f"    return {func_name}_recursive(items[1:], acc + [items[0]])\n")
+
+    # ── Evaluation ───────────────────────────────────────────────────────────
+
+    def _level1_verifier(self, code: str) -> float:
+        """
+        Internal VerifierHead evaluation.
+        When a CogForge model is present, tokenise the code, run a forward
+        pass, and read the verifier score.  Otherwise, fall back to a fast
+        heuristic that checks for basic Python validity and style signals.
+        """
+        if self.model is not None:
+            try:
+                # Minimal tokenisation: use character IDs clamped to vocab_size
+                cfg = self.model.config
+                char_ids = [ord(c) % cfg.vocab_size for c in code[:cfg.max_seq_len]]
+                if not char_ids:
+                    return 0.0
+                ids = torch.tensor([char_ids], dtype=torch.long)
+                with torch.no_grad():
+                    out = self.model(ids, return_verifier=True)
+                score = out.get("verifier_score")
+                if score is not None:
+                    return float(score.mean().item())
+            except Exception:
+                pass
+
+        # Heuristic fallback
+        score = 0.5
+        # Positive signals: has a def, has a return, has docstring, no pass
+        if re.search(r"\bdef\s+\w+", code):
+            score += 0.1
+        if "return" in code:
+            score += 0.1
+        if '"""' in code or "'''" in code:
+            score += 0.05
+        if re.search(r"\bpass\s*$", code, re.MULTILINE):
+            score -= 0.15   # bare pass = not implemented
+        if re.search(r"TODO|FIXME|HACK", code):
+            score -= 0.1
+        # Negative: obvious truncation or missing colon
+        if code.count("def ") > code.count(":"):
+            score -= 0.2
+        return max(0.0, min(1.0, score))
+
+    def _level2_execute(self, code: str, run_tests: bool = False) -> Dict:
+        """
+        External execution via TerminalGuy.
+        Stage A: python3 -m py_compile (syntax check).
+        Stage B (if run_tests): python3 -m pytest (unit tests, if any exist).
+
+        Returns dict: {compiles: bool, tests_pass: bool | None, stderr: str}
+        """
+        # Write code to a temp file
+        tmp_path = os.path.join(
+            tempfile.gettempdir(),
+            f"cogsearch_{uuid.uuid4().hex[:8]}.py"
+        )
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(code)
+
+            # Stage A: syntax compile check
+            compile_result = self.terminal_guy._run_command(
+                f"python3 -m py_compile {tmp_path}", timeout=10
+            )
+            compiles = (compile_result["returncode"] == 0)
+
+            tests_pass: Optional[bool] = None
+            test_stderr = ""
+
+            if compiles and run_tests:
+                # Stage B: pytest (only if a test suite exists alongside)
+                test_result = self.terminal_guy._run_command(
+                    f"python3 -m pytest {tmp_path} --tb=short -q", timeout=20
+                )
+                tests_pass = (test_result["returncode"] == 0)
+                test_stderr = test_result.get("stderr", "")[:500]
+
+            return {
+                "compiles":    compiles,
+                "tests_pass":  tests_pass,
+                "stderr":      (compile_result.get("stderr", "") + test_stderr)[:600],
+            }
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    def _compute_reward(self, code: str, verifier_score: float,
+                        exec_result: Dict, run_tests: bool) -> float:
+        """
+        Map evaluation results to a scalar reward in [-1, 1].
+
+          - Fails to compile            → REWARD_SYNTAX_ERROR  (-1.0)
+          - Compiles, verifier low      → REWARD_LOGIC_FLAW    (0.1)
+          - Compiles, verifier ok       → REWARD_COMPILES_CLEAN (0.5)
+          - Compiles + passes tests     → REWARD_PASSES_TESTS   (1.0)
+
+        Pessimist high-risk issues apply a 0.2 penalty on top.
+        """
+        if not exec_result["compiles"]:
+            return self.REWARD_SYNTAX_ERROR
+
+        if run_tests and exec_result.get("tests_pass") is True:
+            reward = self.REWARD_PASSES_TESTS
+        elif verifier_score >= self.verifier_threshold:
+            reward = self.REWARD_COMPILES_CLEAN
+        else:
+            reward = self.REWARD_LOGIC_FLAW
+
+        # Pessimist penalty for logic flaws
+        critiques = self.pessimist._critique_code(code)
+        high_risk  = [c for c in critiques if c["risk"] == "high"]
+        if high_risk:
+            reward -= 0.2 * len(high_risk)
+
+        return max(self.REWARD_SYNTAX_ERROR, min(self.REWARD_PASSES_TESTS, reward))
+
+    # ── Backpropagation ──────────────────────────────────────────────────────
+
+    def _backpropagate(self, node: MCTSNode, reward: float) -> None:
+        """
+        Walk from *node* to the root, incrementing visits and accumulating
+        total_reward at every ancestor.
+        """
+        current = node
+        while current is not None:
+            current.visits      += 1
+            current.total_reward += reward
+            current = current.parent
+
+    # ── Best path extraction ─────────────────────────────────────────────────
+
+    def _best_leaf(self, root: MCTSNode) -> MCTSNode:
+        """
+        BFS over all nodes; return the visited leaf with the highest mean reward.
+        """
+        best: MCTSNode = root
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.visits > 0 and node.mean_reward > best.mean_reward:
+                best = node
+            stack.extend(node.children)
+        return best
+
+    def _collect_all_leaves(self, root: MCTSNode) -> List[MCTSNode]:
+        """Return all leaf nodes in the tree (depth-first)."""
+        leaves: List[MCTSNode] = []
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.is_leaf() and node.visits > 0:
+                leaves.append(node)
+            stack.extend(node.children)
+        return leaves
+
+    # ── DPO pair generation ──────────────────────────────────────────────────
+
+    def _record_dpo_pair(self, prompt: str, winner: MCTSNode,
+                         loser: MCTSNode) -> None:
+        """
+        Save a preference pair for offline DPO fine-tuning.
+        Pairs are stored as {prompt, winning_code, losing_code, reward_delta}.
+        """
+        self._dpo_pairs.append({
+            "prompt":        prompt,
+            "winning_code":  winner.code,
+            "losing_code":   loser.code,
+            "reward_delta":  winner.mean_reward - loser.mean_reward,
+        })
+
+    def get_dpo_pairs(self) -> List[Dict]:
+        """Return accumulated DPO training pairs from all searches so far."""
+        return list(self._dpo_pairs)
+
+    # ── Main search entry point ──────────────────────────────────────────────
+
+    def search(
+        self,
+        prompt:     str,
+        iterations: int  = 10,
+        run_tests:  bool = False,
+        initial_code: str = "",
+    ) -> Dict:
+        """
+        Run CogSearch for *iterations* MCTS steps.
+
+        Args:
+            prompt:       Natural-language description of what to generate.
+            iterations:   Number of select→expand→evaluate→backprop cycles.
+            run_tests:    If True, attempt `python3 -m pytest` on each candidate.
+            initial_code: Seed code to prepend to all expansions.
+
+        Returns dict with:
+            best_code:       str   — highest-reward code found.
+            best_reward:     float — reward of best node.
+            dpo_pairs:       list  — new DPO pairs generated during this search.
+            tree_stats:      dict  — nodes explored, depth, etc.
+            all_leaves:      list  — sorted (reward, code) tuples for all leaves.
+        """
+        root = MCTSNode(code=initial_code, depth=0)
+        root.visits = 1   # mark root as already visited
+
+        nodes_evaluated = 0
+
+        for iteration in range(iterations):
+            # ─── 1. Selection ───────────────────────────────────────────────
+            selected = self._select(root)
+
+            # If selected node is terminal (already passed tests), skip
+            if selected.terminal:
+                continue
+
+            # ─── 2. Expansion ───────────────────────────────────────────────
+            new_children = self._expand(selected, prompt)
+
+            # ─── 3 & 4. Evaluate each child (Simulation + Reward) ───────────
+            for child in new_children:
+                nodes_evaluated += 1
+
+                # Level 1: VerifierHead (fast, internal)
+                v_score = self._level1_verifier(child.code)
+                if v_score < self.verifier_threshold:
+                    # Kill branch immediately — don't waste execution budget
+                    reward = self.REWARD_SYNTAX_ERROR * 0.5  # softer penalty
+                    self._backpropagate(child, reward)
+                    continue
+
+                # Level 2: Actual execution (external oracle)
+                exec_result = self._level2_execute(child.code, run_tests)
+
+                reward = self._compute_reward(child.code, v_score, exec_result, run_tests)
+
+                if exec_result.get("tests_pass") is True:
+                    child.terminal = True
+
+                # ─── 5. Backpropagation ──────────────────────────────────────
+                self._backpropagate(child, reward)
+
+        # ── Collect results ──────────────────────────────────────────────────
+        best_node = self._best_leaf(root)
+        all_leaves = sorted(
+            [(n.mean_reward, n.code) for n in self._collect_all_leaves(root)],
+            key=lambda x: -x[0]
+        )
+
+        # Generate DPO pairs: pair each adjacent best/worst leaf
+        leaves_by_reward = sorted(
+            self._collect_all_leaves(root),
+            key=lambda n: -n.mean_reward
+        )
+        if len(leaves_by_reward) >= 2:
+            for i in range(min(3, len(leaves_by_reward) // 2)):
+                winner = leaves_by_reward[i]
+                loser  = leaves_by_reward[-(i + 1)]
+                if winner.mean_reward > loser.mean_reward + 0.1:
+                    self._record_dpo_pair(prompt, winner, loser)
+
+        # Max depth reached in tree
+        all_nodes: List[MCTSNode] = []
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            all_nodes.append(n)
+            stack.extend(n.children)
+        max_depth = max((n.depth for n in all_nodes), default=0)
+
+        return {
+            "best_code":      best_node.code,
+            "best_reward":    best_node.mean_reward,
+            "best_visits":    best_node.visits,
+            "dpo_pairs":      self.get_dpo_pairs(),
+            "tree_stats": {
+                "total_nodes":     len(all_nodes),
+                "nodes_evaluated": nodes_evaluated,
+                "max_depth":       max_depth,
+                "iterations":      iterations,
+            },
+            "all_leaves": all_leaves[:10],
+        }
+
+
+# ===========================================================================
 # CogWorks Swarm  —  orchestration entry point
 # ===========================================================================
 
@@ -2310,17 +3526,20 @@ class CogWorksSwarm:
     """
     Instantiates all swarm agents around a shared memory store (and optionally
     a shared CogForge model).  Exposes a single `.run(task, repo_root)` entry
-    point that mirrors the documented workflow.
+    point that mirrors the documented workflow, plus `.cog_search(prompt)` for
+    Execution-Guided MCTS code generation.
 
     Workflow:
       1. Coordinator delegates to Planner + Explorer (parallel).
       2. Dreamer injects context.
-      3. Planner outputs DAG → ProblemSolver refines.
-      4. Engineer → Pessimist → BugFinder + VulnerabilityFinder.
-      5. TerminalGuy executes tests.
-      6. Documentor annotates.
-      7. Coordinator gates on verifier score.
-      8. Dreamer consolidates into long-term memory.
+      3. Archeologist maps git history → temporal caution zones.
+      4. Nexus audits dependencies → RAG cache built.
+      5. Planner outputs DAG → ProblemSolver refines.
+      6. Engineer → Pessimist → BugFinder + VulnerabilityFinder.
+      7. TerminalGuy executes tests.
+      8. Documentor annotates.
+      9. Coordinator gates on verifier score.
+     10. Dreamer consolidates into long-term memory.
     """
 
     def __init__(self, model: Optional[CogForge] = None,
@@ -2328,31 +3547,45 @@ class CogWorksSwarm:
         self.shared_memory = SharedMemoryStore()
         cfg = config or CogForgeConfig()
 
-        self.coordinator         = Coordinator(self.shared_memory, model)
-        self.dreamer             = Dreamer(self.shared_memory, model, cfg)
-        self.explorer            = Explorer(self.shared_memory, model)
-        self.planner             = Planner(self.shared_memory, model)
-        self.problem_solver      = ProblemSolver(self.shared_memory, model)
-        self.engineer            = Engineer(self.shared_memory, model)
-        self.bug_finder          = BugFinder(self.shared_memory, model)
-        self.terminal_guy        = TerminalGuy(self.shared_memory, model)
+        self.coordinator          = Coordinator(self.shared_memory, model)
+        self.dreamer              = Dreamer(self.shared_memory, model, cfg)
+        self.explorer             = Explorer(self.shared_memory, model)
+        self.planner              = Planner(self.shared_memory, model)
+        self.problem_solver       = ProblemSolver(self.shared_memory, model)
+        self.engineer             = Engineer(self.shared_memory, model)
+        self.bug_finder           = BugFinder(self.shared_memory, model)
+        self.terminal_guy         = TerminalGuy(self.shared_memory, model)
         self.vulnerability_finder = VulnerabilityFinder(self.shared_memory, model)
-        self.pessimist           = Pessimist(self.shared_memory, model)
-        self.documentor          = Documentor(self.shared_memory, model)
+        self.pessimist            = Pessimist(self.shared_memory, model)
+        self.documentor           = Documentor(self.shared_memory, model)
+        self.nexus                = Nexus(self.shared_memory, model)
+        self.archeologist         = Archeologist(self.shared_memory, model)
+
+        # CogSearch MCTS engine — wires ProblemSolver, TerminalGuy, Pessimist
+        self.cog_search_engine = CogSearch(
+            problem_solver=self.problem_solver,
+            terminal_guy=self.terminal_guy,
+            pessimist=self.pessimist,
+            model=model,
+        )
 
         self._agents: Dict[str, BaseAgent] = {
-            "Coordinator":         self.coordinator,
-            "Dreamer":             self.dreamer,
-            "Explorer":            self.explorer,
-            "Planner":             self.planner,
-            "ProblemSolver":       self.problem_solver,
-            "Engineer":            self.engineer,
-            "BugFinder":           self.bug_finder,
-            "TerminalGuy":         self.terminal_guy,
-            "VulnerabilityFinder": self.vulnerability_finder,
-            "Pessimist":           self.pessimist,
-            "Documentor":          self.documentor,
+            "Coordinator":          self.coordinator,
+            "Dreamer":              self.dreamer,
+            "Explorer":             self.explorer,
+            "Planner":              self.planner,
+            "ProblemSolver":        self.problem_solver,
+            "Engineer":             self.engineer,
+            "BugFinder":            self.bug_finder,
+            "TerminalGuy":          self.terminal_guy,
+            "VulnerabilityFinder":  self.vulnerability_finder,
+            "Pessimist":            self.pessimist,
+            "Documentor":           self.documentor,
+            "Nexus":                self.nexus,
+            "Archeologist":         self.archeologist,
         }
+
+    # ── Full pipeline ─────────────────────────────────────────────────────────
 
     def run(self, task: str, repo_root: str = ".") -> Dict[str, Any]:
         """
@@ -2369,55 +3602,120 @@ class CogWorksSwarm:
         dreamer_msg = self.dreamer.run(task)
         results["dreamer_context"] = dreamer_msg.message
 
-        # Step 3: Explorer maps the repo
+        # Step 3: Explorer maps the repo (builds shared repo_map)
         explore_msg = self.explorer.run(task, root=repo_root)
         results["explorer"] = explore_msg.artifacts
 
-        # Step 4: Planner decomposes the task
+        # Step 4: Archeologist — git history & intent analysis
+        arch_msg = self.archeologist.run(task, root=repo_root)
+        results["archeologist"] = arch_msg.artifacts
+
+        # Step 5: Nexus — dependency audit & RAG cache
+        nexus_msg = self.nexus.run(task, root=repo_root)
+        results["nexus"] = nexus_msg.artifacts
+
+        # Step 6: Planner decomposes the task
         plan_msg = self.planner.run(task)
         results["planner"] = plan_msg.artifacts
 
-        # Step 5: ProblemSolver analyses and annotates
+        # Step 7: ProblemSolver analyses and annotates
         ps_msg = self.problem_solver.run(task)
         results["problem_solver"] = ps_msg.artifacts
 
-        # Step 6: Engineer reviews code quality
+        # Step 8: Engineer reviews code quality
         eng_msg = self.engineer.run(task)
         results["engineer"] = eng_msg.artifacts
 
-        # Step 7: Pessimist stress-tests
+        # Step 9: Pessimist stress-tests
         pess_msg = self.pessimist.run(task)
         results["pessimist"] = pess_msg.artifacts
 
-        # Step 8: BugFinder deep inspection
+        # Step 10: BugFinder deep inspection
         bug_msg = self.bug_finder.run(task)
         results["bug_finder"] = bug_msg.artifacts
 
-        # Step 9: VulnerabilityFinder security scan
+        # Step 11: VulnerabilityFinder security scan
         vuln_msg = self.vulnerability_finder.run(task)
         results["vulnerability_finder"] = vuln_msg.artifacts
 
-        # Step 10: TerminalGuy runs tests
+        # Step 12: TerminalGuy runs tests
         term_msg = self.terminal_guy.run(task, command="python -m pytest --tb=short -q")
         results["terminal_guy"] = term_msg.artifacts
 
-        # Step 11: Documentor annotates
+        # Step 13: Documentor annotates
         flagged = self.shared_memory.get_flagged_files()
         doc_msg = self.documentor.run(task, files=flagged)
         results["documentor"] = doc_msg.artifacts
 
-        # Step 12: Dreamer consolidates
+        # Step 14: Dreamer consolidates
         self.dreamer.maybe_consolidate_episodic()
         results["dreamer_consolidation"] = "complete"
 
-        # Step 13: Coordinator quality gate
-        # Use pessimist confidence as a proxy for verifier score
+        # Step 15: Coordinator quality gate
         verifier_proxy = pess_msg.confidence
         gate_decision = self.coordinator.review_and_gate(verifier_proxy, plan_msg.task_id)
-        results["quality_gate"] = gate_decision
-        results["verifier_proxy_score"] = verifier_proxy
+        results["quality_gate"]          = gate_decision
+        results["verifier_proxy_score"]  = verifier_proxy
 
         return results
+
+    # ── CogSearch entry point ─────────────────────────────────────────────────
+
+    def cog_search(
+        self,
+        prompt:       str,
+        iterations:   int  = 10,
+        run_tests:    bool = False,
+        initial_code: str  = "",
+        k_expansions: int  = 3,
+    ) -> Dict[str, Any]:
+        """
+        Run Execution-Guided MCTS to find the best code for *prompt*.
+
+        Each iteration:
+          1. SELECT   — UCT picks the most promising partial code branch.
+          2. EXPAND   — ProblemSolver generates k_expansions candidate fragments.
+          3. EVALUATE — VerifierHead scores each; TerminalGuy compiles/runs them.
+          4. REWARD   — syntax error → -1.0 | logic flaw → 0.1 | passes → 1.0
+          5. BACKPROP — reward flows up to root through all ancestors.
+
+        Returns dict with:
+          best_code:   The highest-reward code found.
+          best_reward: Reward score of best_code.
+          dpo_pairs:   List of (prompt, winning_code, losing_code) training pairs.
+          tree_stats:  Search statistics (nodes, depth, iterations).
+          all_leaves:  Top-10 leaves sorted by reward.
+        """
+        self.cog_search_engine.k_expansions = k_expansions
+        result = self.cog_search_engine.search(
+            prompt=prompt,
+            iterations=iterations,
+            run_tests=run_tests,
+            initial_code=initial_code,
+        )
+
+        # Store best code and DPO pairs in shared memory
+        self.shared_memory.set("cog_search_best_code", result["best_code"])
+        self.shared_memory.set("cog_search_dpo_pairs", result["dpo_pairs"])
+
+        # Log result as a handoff from ProblemSolver → Coordinator
+        self.coordinator.emit(
+            target="Coordinator",
+            message=(
+                f"CogSearch complete. Best reward: {result['best_reward']:.3f}. "
+                f"Explored {result['tree_stats']['total_nodes']} nodes in "
+                f"{result['tree_stats']['iterations']} iterations. "
+                f"Generated {len(result['dpo_pairs'])} DPO training pairs."
+            ),
+            artifacts={
+                "best_reward": result["best_reward"],
+                "tree_stats":  result["tree_stats"],
+                "n_dpo_pairs": len(result["dpo_pairs"]),
+            },
+            status="done",
+        )
+
+        return result
 
 
 # ===========================================================================
@@ -2446,11 +3744,55 @@ if __name__ == "__main__":
     print(f"  verifier_score:  {out['verifier_score']}")
     print(f"  recommended_agent: {out['recommended_agent']}")
 
-    # Swarm smoke test (no real repo files — just exercises the pipeline)
-    print("\n--- CogWorks Swarm ---")
+    # ── CogWorks Swarm smoke test ────────────────────────────────────────────
+    print("\n--- CogWorks Swarm (full pipeline) ---")
     swarm = CogWorksSwarm(model=model, config=cfg)
     results = swarm.run("Refactor auth module for better security and testability",
                         repo_root=".")
     print(f"Quality gate decision: {results['quality_gate']}")
     print(f"Verifier proxy score:  {results['verifier_proxy_score']:.3f}")
     print(f"Agents completed:      {list(results.keys())}")
+
+    # ── Archeologist smoke test ──────────────────────────────────────────────
+    print("\n--- Archeologist ---")
+    arch_artifacts = results.get("archeologist", {})
+    global_stats = arch_artifacts.get("global_stats", {})
+    print(f"Total commits in repo:         {global_stats.get('total_commits', 'N/A')}")
+    print(f"Volatile files flagged:        {len(arch_artifacts.get('volatile_files', []))}")
+    print(f"Caution-zone files:            {len(arch_artifacts.get('caution_files', []))}")
+    print(f"Stale files (2+ yrs):          {len(arch_artifacts.get('stale_files', []))}")
+
+    # ── Nexus smoke test ─────────────────────────────────────────────────────
+    print("\n--- Nexus ---")
+    nexus_artifacts = results.get("nexus", {})
+    rag_cache = nexus_artifacts.get("rag_cache", {})
+    hallucinated = nexus_artifacts.get("hallucinated_packages", [])
+    deprecated   = nexus_artifacts.get("deprecated_issues", [])
+    print(f"RAG cache entries:             {len(rag_cache)}")
+    print(f"Hallucinated packages:         {hallucinated or 'none'}")
+    print(f"Deprecated API usages:         {len(deprecated)}")
+    # Query RAG for torch
+    torch_info = swarm.nexus.query_api("torch", "nn.Linear")
+    print(f"Nexus RAG query (torch):       source={torch_info.get('source')} "
+          f"symbol_found={torch_info.get('symbol_found')}")
+
+    # ── CogSearch MCTS smoke test ────────────────────────────────────────────
+    print("\n--- CogSearch (Execution-Guided MCTS) ---")
+    search_result = swarm.cog_search(
+        prompt="Write a function that filters a list of integers, keeping only primes",
+        iterations=6,
+        run_tests=False,
+        k_expansions=3,
+    )
+    print(f"Best reward:    {search_result['best_reward']:.3f}")
+    print(f"Tree stats:     {search_result['tree_stats']}")
+    print(f"DPO pairs gen:  {len(search_result['dpo_pairs'])}")
+    print(f"Top leaves:")
+    for reward, code_preview in search_result["all_leaves"][:3]:
+        preview = code_preview.replace("\n", " ")[:80]
+        print(f"  [{reward:+.2f}] {preview}…")
+    if search_result["dpo_pairs"]:
+        pair = search_result["dpo_pairs"][0]
+        print(f"\nSample DPO pair (reward delta = {pair['reward_delta']:+.3f}):")
+        print(f"  Winner preview: {pair['winning_code'][:60].strip()}…")
+        print(f"  Loser  preview: {pair['losing_code'][:60].strip()}…")
