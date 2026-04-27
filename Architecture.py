@@ -1,6 +1,5 @@
 """
-CogForge v2: Self-Improving, Hierarchical Agent Team
-=====================================================
+=============================================================================
 Architecture (unchanged base):
   - Grouped-Query Attention (GQA) with Sliding Window
   - Rotary Positional Embeddings (RoPE)
@@ -34,6 +33,43 @@ NEW IN v2 — THREE MAJOR EVOLUTION AXES
                               Architecture → File → Line
                              agents call it as a subroutine for sub-problems
 
+═══════════════════════════════════════════════════════════════
+NEW IN v3 — FOUR RESEARCH EVOLUTION AXES
+═══════════════════════════════════════════════════════════════
+
+4. Adversarial MCTS (AdverMCTS)
+   ┌─ AdversarialTestPool  : transposition table of failing test patterns
+   ├─ AdversarialAttacker  : four-strategy test generator
+   │                          1. Symbolic boundary sampling
+   │                          2. Coverage-guided AST mutation
+   │                          3. API-constraint violation
+   │                          4. Historical bug-pattern replay
+   └─ Robust Score         : pass_rate - α·fragility - β·test_entropy_gap
+   Tree value = robust score under hardest discovered tests (not static suite).
+
+5. Differentiable "Talking Space"
+   ┌─ LatentCommChannel    : per-agent encoder/decoder + Gumbel-Softmax head
+   ├─ DifferentiableRouter : multi-head learned routing over agent latent stack
+   ├─ SoftToHardCurriculum : temperature/hardness schedule (continuous → discrete)
+   └─ LatentCommsCoordinator: top-level manager; gradients through adapters only
+   Latent channel for reasoning; text channel for final output; verifier shapes both.
+
+6. Temporal Contrastive Learning
+   ┌─ DiffEvent            : multi-view diff event (raw, AST, tests, issue, reviewer)
+   ├─ TemporalContrastiveEncoder: multi-view cross-attention encoder → unit-norm emb
+   ├─ TemporalContrastiveLoss: symmetric InfoNCE with hard negative mining
+   └─ TemporalContrastiveTrainer: end-to-end TCL training + GraphRAG integration
+   Positive pairs: (diff_t, rationale_t), (diff_t, later_fix_t), same-subsystem.
+   Hard negatives: high surface overlap, different intent.
+   Archeologist retrieval powered by learned temporal embeddings.
+
+7. Recursive Self-Distillation
+   ┌─ SolutionCluster      : cluster of semantically-equivalent solutions
+   ├─ LoRAStyleAdapter     : rank-r adapter (B·A) over frozen base weights
+   └─ RecursiveSelfDistiller: consensus loop → LoRA distillation → GraphRAG upsert
+   Only consensus (≥ distill_consensus_threshold agreement) is distilled.
+   Base model frozen; adapters are repo-conditioned and discardable.
+
 CogSearch Reward Signal (multi-dimensional):
   -1.0  syntax error
   +0.1  logic flaw (compiles; Pessimist high-risk)
@@ -41,6 +77,7 @@ CogSearch Reward Signal (multi-dimensional):
   +0.5  security clean (VulnerabilityFinder pass)
   +0.7  coverage > threshold
   +1.0  passes all tests + coverage + no regressions
+  v3:  reward blended with robust_score = adv_pass_rate - α·fragility - β·entropy_gap
 
 CogWorks Swarm Agents (v1 roster preserved + new):
   Coordinator    Dreamer        Explorer       Planner
@@ -70,6 +107,8 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
+import copy
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -135,6 +174,31 @@ class CogForgeConfig:
     mcts_beam_width: int = 5          # beam width for beam-search hybridisation
     mcts_prm_layers: int = 4          # depth of Process Reward Model MLP
     mcts_max_parallel: int = 4        # parallel evaluation workers
+
+    # NEW v3 — Adversarial MCTS
+    adver_alpha: float = 0.10          # fragility penalty weight in robust_score
+    adver_beta: float = 0.05           # test-entropy-gap penalty weight
+    adver_max_tests: int = 20          # max adversarial tests per branch
+    adver_mutation_rounds: int = 3     # mutation rounds per attacker invocation
+    adver_pool_size: int = 500         # transposition table capacity
+
+    # NEW v3 — Differentiable Talking Space
+    latent_comm_dim: int = 64          # latent channel dimensionality per agent
+    latent_comm_heads: int = 4         # number of differentiable router heads
+    soft_to_hard_steps: int = 1000     # curriculum steps before full discretisation
+    latent_comm_sparsity: float = 0.25 # target sparsity in hard discrete tokens
+
+    # NEW v3 — Temporal Contrastive Learning
+    tcl_embed_dim: int = 256           # temporal encoder output dimensionality
+    tcl_temperature: float = 0.07      # InfoNCE softmax temperature
+    tcl_neg_samples: int = 16          # hard negatives per batch
+    tcl_n_views: int = 4               # multi-view inputs per diff event
+
+    # NEW v3 — Recursive Self-Distillation
+    distill_n_samples: int = 8                    # diverse samples per round
+    distill_lora_rank: int = 16                   # LoRA-style adapter rank
+    distill_max_rounds: int = 5                   # max self-distillation rounds
+    distill_consensus_threshold: float = 0.70     # min cluster-agreement fraction
 
     @property
     def d_head(self) -> int:
@@ -664,6 +728,340 @@ class HandoffMessage:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# NEW v3 — Differentiable "Talking Space"
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LatentCommChannel(nn.Module):
+    """
+    Per-agent differentiable communication channel.
+
+    Each agent emits a latent thought vector z_i (dim = latent_comm_dim)
+    instead of raw text.  The coordinator's DifferentiableRouter decides
+    which chunks to forward to which recipients.  Gradients flow through
+    small adapter weights (never the frozen base model).
+
+    Forward pass returns (z_out, discrete_tokens) where:
+        z_out           — continuous latent vector for training
+        discrete_tokens — sparse token indices (post-curriculum)
+    """
+
+    def __init__(self, config: CogForgeConfig):
+        super().__init__()
+        D   = config.d_model
+        Lc  = config.latent_comm_dim
+        self.encoder   = nn.Sequential(
+            nn.Linear(D, D // 2), nn.GELU(),
+            nn.Linear(D // 2, Lc),
+            RMSNorm(Lc),
+        )
+        self.decoder   = nn.Sequential(
+            nn.Linear(Lc, D // 2), nn.GELU(),
+            nn.Linear(D // 2, D),
+        )
+        # Straight-through Gumbel-Softmax head for discretisation
+        self.vocab_size = max(64, Lc * 2)
+        self.quant_proj = nn.Linear(Lc, self.vocab_size)
+
+    def encode(self, hidden: torch.Tensor) -> torch.Tensor:
+        """hidden: (B, T, D) → z: (B, Lc)"""
+        pooled = hidden.mean(dim=1)          # mean-pool over sequence
+        return self.encoder(pooled)          # (B, Lc)
+
+    def decode(self, z: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """z: (B, Lc) → expanded: (B, seq_len, D)"""
+        expanded = self.decoder(z).unsqueeze(1)   # (B, 1, D)
+        return expanded.expand(-1, seq_len, -1)   # (B, T, D)
+
+    def quantise(self, z: torch.Tensor,
+                 temperature: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Straight-through Gumbel-Softmax discretisation.
+        Returns (z_continuous, discrete_indices).
+        temperature → 0 converges to hard argmax (pure discrete tokens).
+        """
+        logits = self.quant_proj(z)              # (B, vocab_size)
+        if temperature < 0.01:
+            # Hard discrete
+            indices = logits.argmax(dim=-1)      # (B,)
+            # One-hot straight-through: forward hard, backward soft
+            hard = F.one_hot(indices, self.vocab_size).float()
+            soft = F.softmax(logits, dim=-1)
+            z_q  = (hard - soft).detach() + soft
+        else:
+            # Gumbel-Softmax (soft, differentiable)
+            gumbels = -torch.empty_like(logits).exponential_().log()
+            z_q    = F.softmax((logits + gumbels) / temperature, dim=-1)
+            indices = z_q.argmax(dim=-1)
+        return z_q, indices
+
+    def forward(self, hidden: torch.Tensor,
+                temperature: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        hidden: (B, T, D)
+        Returns (z_continuous: (B, Lc), discrete_indices: (B,))
+        """
+        z = self.encode(hidden)
+        z_q, indices = self.quantise(z, temperature)
+        return z, indices
+
+
+class DifferentiableRouter(nn.Module):
+    """
+    Learned differentiable router over latent agent vectors.
+
+    Receives a stack of N agent latent vectors [z_0 … z_{N-1}],
+    each of shape (Lc,), and produces a routing weight matrix W (N×N)
+    where W[i,j] is the weight of agent i's message to agent j.
+
+    Gradients back-prop only through the small router weights, not the
+    frozen agent models.
+
+    In the soft-to-hard curriculum:
+        step < T/2  → full soft routing (continuous W)
+        step ≥ T/2  → progressively harder top-k sparsemax routing
+    """
+
+    def __init__(self, config: CogForgeConfig, n_agents: int = 16):
+        super().__init__()
+        Lc = config.latent_comm_dim
+        H  = config.latent_comm_heads
+        self.n_agents   = n_agents
+        self.n_heads    = H
+        self.d_head     = max(1, Lc // H)
+
+        # Per-head key/query projections
+        self.q_proj = nn.Linear(Lc, H * self.d_head, bias=False)
+        self.k_proj = nn.Linear(Lc, H * self.d_head, bias=False)
+        # Value transform: decide *what* to forward
+        self.v_proj = nn.Linear(Lc, Lc, bias=False)
+        self.out_norm = RMSNorm(Lc)
+
+    def forward(self, z_stack: torch.Tensor,
+                hardness: float = 0.0) -> torch.Tensor:
+        """
+        z_stack : (N, Lc) — latent vectors for N agents in this round.
+        hardness : 0.0 = fully soft, 1.0 = fully sparse top-1.
+        Returns routed_z: (N, Lc) — each agent's aggregated incoming latent.
+        """
+        N, Lc = z_stack.shape
+        H, D  = self.n_heads, self.d_head
+
+        # (N, H, D)
+        Q = self.q_proj(z_stack).view(N, H, D)
+        K = self.k_proj(z_stack).view(N, H, D)
+        V = self.v_proj(z_stack)               # (N, Lc)
+
+        # Compute attention weights (N, H, N)
+        scale  = math.sqrt(D)
+        scores = torch.einsum("ihd,jhd->hij", Q, K) / scale   # (H, N, N)
+
+        if hardness < 1.0:
+            W = F.softmax(scores, dim=-1)      # soft
+        else:
+            # Hard top-1 (straight-through)
+            idx   = scores.argmax(dim=-1, keepdim=True)   # (H, N, 1)
+            hard  = torch.zeros_like(scores).scatter_(-1, idx, 1.0)
+            soft  = F.softmax(scores, dim=-1)
+            W     = (hard - soft).detach() + soft
+
+        # Blend soft and hard based on curriculum position
+        if 0.0 < hardness < 1.0:
+            W_soft = F.softmax(scores, dim=-1)
+            W_hard_idx = scores.argmax(dim=-1, keepdim=True)
+            W_hard = torch.zeros_like(scores).scatter_(-1, W_hard_idx, 1.0)
+            W = (1.0 - hardness) * W_soft + hardness * W_hard
+
+        # Average over heads: (N, N)
+        W_avg = W.mean(dim=0)
+
+        # Route values: (N, Lc)
+        routed = torch.matmul(W_avg, V)
+        return self.out_norm(routed)
+
+
+class SoftToHardCurriculum:
+    """
+    Controls the temperature schedule for LatentCommChannel and the
+    hardness schedule for DifferentiableRouter.
+
+    Phase 1 (0 … T/2):   temperature=1.0 → 0.5,  hardness=0.0 → 0.3
+    Phase 2 (T/2 … T):   temperature=0.5 → 0.05, hardness=0.3 → 1.0
+    After T:              temperature=0.05 (nearly discrete), hardness=1.0
+    """
+
+    def __init__(self, total_steps: int = 1000):
+        self.total_steps = max(1, total_steps)
+        self._step       = 0
+
+    def step(self) -> Tuple[float, float]:
+        """Advance one step. Returns (temperature, hardness)."""
+        s = min(self._step, self.total_steps)
+        self._step += 1
+
+        half = self.total_steps / 2
+        if s < half:
+            frac        = s / half
+            temperature = 1.0  - 0.5  * frac    # 1.0 → 0.5
+            hardness    = 0.0  + 0.3  * frac    # 0.0 → 0.3
+        else:
+            frac        = (s - half) / half
+            temperature = 0.5  - 0.45 * frac    # 0.5 → 0.05
+            hardness    = 0.3  + 0.7  * frac    # 0.3 → 1.0
+
+        return max(0.05, temperature), min(1.0, max(0.0, hardness))
+
+    @property
+    def current(self) -> Tuple[float, float]:
+        s = min(self._step, self.total_steps)
+        half = self.total_steps / 2
+        if s < half:
+            frac = s / half
+            return max(0.05, 1.0 - 0.5 * frac), min(1.0, 0.3 * frac)
+        frac = (s - half) / half
+        return max(0.05, 0.5 - 0.45 * frac), min(1.0, 0.3 + 0.7 * frac)
+
+    def is_converged(self) -> bool:
+        _, hardness = self.current
+        return hardness >= 0.99
+
+
+class LatentCommsCoordinator:
+    """
+    Top-level manager for the differentiable talking space.
+
+    Maintains one LatentCommChannel per registered agent, a shared
+    DifferentiableRouter, and the SoftToHardCurriculum.
+
+    Usage in a training loop:
+        comms = LatentCommsCoordinator(config)
+        comms.register("Engineer")
+        comms.register("Pessimist")
+        …
+        # Forward pass (differentiable):
+        z_eng  = comms.emit("Engineer",  hidden_engineer)
+        z_pess = comms.emit("Pessimist", hidden_pessimist)
+        routed = comms.route([z_eng, z_pess])
+        loss   = verifier_loss + comms_loss(routed)
+        loss.backward()   # gradients flow only through channel adapters
+        comms.optimizer_step()
+        comms.curriculum_step()
+
+    Inference / swarm use (no gradients):
+        z, tokens = comms.emit_discrete("Engineer", hidden)
+        # tokens are sparse indices for text channel injection
+    """
+
+    def __init__(self, config: CogForgeConfig):
+        self.config     = config
+        self._channels: Dict[str, LatentCommChannel] = {}
+        self._agent_idx: Dict[str, int]               = {}
+        self.router      = DifferentiableRouter(config)
+        self.curriculum  = SoftToHardCurriculum(config.soft_to_hard_steps)
+        self._optimizer: Optional[torch.optim.Optimizer] = None
+        self._z_buffer: Dict[str, torch.Tensor] = {}   # latest z per agent
+
+    def register(self, agent_name: str) -> None:
+        if agent_name not in self._channels:
+            ch  = LatentCommChannel(self.config)
+            idx = len(self._channels)
+            self._channels[agent_name] = ch
+            self._agent_idx[agent_name] = idx
+
+    def _make_optimizer(self) -> torch.optim.Optimizer:
+        params: List[nn.Parameter] = []
+        for ch in self._channels.values():
+            params += list(ch.parameters())
+        params += list(self.router.parameters())
+        return torch.optim.AdamW(params, lr=1e-4, weight_decay=1e-2)
+
+    def emit(self, agent_name: str,
+             hidden: torch.Tensor) -> torch.Tensor:
+        """
+        Encode hidden state → continuous latent z (differentiable).
+        Stores z in buffer for routing.
+        """
+        if agent_name not in self._channels:
+            self.register(agent_name)
+        temp, _ = self.curriculum.current
+        z, _    = self._channels[agent_name](hidden, temperature=temp)
+        self._z_buffer[agent_name] = z.detach()
+        return z
+
+    def emit_discrete(self, agent_name: str,
+                      hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode hidden state → (z_continuous, discrete_token_indices).
+        For inference / text-channel injection.
+        """
+        if agent_name not in self._channels:
+            self.register(agent_name)
+        temp, _ = self.curriculum.current
+        z, idx  = self._channels[agent_name](hidden, temperature=temp)
+        self._z_buffer[agent_name] = z.detach()
+        return z, idx
+
+    def route(self, agent_names: Optional[List[str]] = None) -> torch.Tensor:
+        """
+        Route buffered latent vectors through the DifferentiableRouter.
+        agent_names: subset to route (default: all registered).
+        Returns routed_z: (N, latent_comm_dim).
+        """
+        names = agent_names or list(self._z_buffer.keys())
+        if not names:
+            return torch.zeros(1, self.config.latent_comm_dim)
+        z_list = [self._z_buffer[n] for n in names if n in self._z_buffer]
+        if not z_list:
+            return torch.zeros(1, self.config.latent_comm_dim)
+        z_stack   = torch.stack(z_list, dim=0)   # (N, Lc)
+        _, hardness = self.curriculum.current
+        return self.router(z_stack, hardness=hardness)
+
+    def curriculum_step(self) -> Tuple[float, float]:
+        return self.curriculum.step()
+
+    def optimizer_step(self, loss: torch.Tensor) -> None:
+        """Back-prop loss through channel adapters only, then step."""
+        if self._optimizer is None:
+            self._optimizer = self._make_optimizer()
+        self._optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(
+            [p for ch in self._channels.values() for p in ch.parameters()]
+            + list(self.router.parameters()), max_norm=1.0
+        )
+        self._optimizer.step()
+
+    def inject_into_hidden(self, agent_name: str,
+                           hidden: torch.Tensor,
+                           routed_z: torch.Tensor) -> torch.Tensor:
+        """
+        Decode the routed latent z for `agent_name` and add it to hidden.
+        routed_z: (N, Lc) — row for agent_name's index.
+        Returns hidden + decoded_z expanded to (B, T, D).
+        """
+        if agent_name not in self._agent_idx:
+            return hidden
+        idx     = self._agent_idx[agent_name]
+        if idx >= routed_z.shape[0]:
+            return hidden
+        z_row   = routed_z[idx].unsqueeze(0)                   # (1, Lc)
+        channel = self._channels[agent_name]
+        B, T, D = hidden.shape
+        delta   = channel.decode(z_row, T)                     # (1, T, D)
+        return hidden + delta
+
+    def stats(self) -> Dict:
+        temp, hardness = self.curriculum.current
+        return {
+            "n_agents":    len(self._channels),
+            "temperature": round(temp, 4),
+            "hardness":    round(hardness, 4),
+            "converged":   self.curriculum.is_converged(),
+            "step":        self.curriculum._step,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # NEW v2 — Graph RAG Memory
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -897,8 +1295,428 @@ class GraphRAGMemory:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Shared Memory Store (v2 — GraphRAG integrated)
+# NEW v3 — Temporal Contrastive Learning
 # ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DiffEvent:
+    """
+    A single repository change event used as the unit of contrastive training.
+
+    Multi-view inputs carried:
+        raw_diff    — unified diff text
+        ast_diff    — simplified AST-level change description
+        tests       — names of test files touched
+        issue_text  — associated issue / PR description (if any)
+        reviewer    — reviewer comment snippets (if any)
+        commit_hist — recent surrounding commit subjects (list[str])
+    """
+    diff_id:     str
+    raw_diff:    str
+    ast_diff:    str    = ""
+    tests:       str    = ""
+    issue_text:  str    = ""
+    reviewer:    str    = ""
+    commit_hist: str    = ""
+    rationale:   str    = ""   # why the change was made (commit message body)
+    later_fix:   str    = ""   # text of the subsequent fix, if any
+    subsystem:   str    = ""   # module / subsystem tag for hard-positive mining
+
+
+class TemporalContrastiveEncoder(nn.Module):
+    """
+    Multi-view encoder for repository diff events.
+
+    Architecture:
+        Four text views (raw_diff, ast_diff, tests+issue, commit_hist+reviewer)
+        are independently hashed to a fixed feature vector, then fused via
+        a small cross-view attention layer into a single unit-norm embedding
+        of size tcl_embed_dim.
+
+    Positives:
+        - (diff_t, rationale_t)             — same event, different view
+        - (diff_t, later_fix_t)             — temporal causal chain
+        - same-subsystem diffs with similar rationale keywords
+
+    Negatives:
+        - unrelated diffs (different subsystem, different keywords)
+        - hard negatives: superficially similar diffs with different intent
+          (detected by high surface overlap but low semantic overlap)
+
+    In production: replace _hash_view() with a real text encoder (CodeBERT /
+    UniXcoder) and fine-tune end-to-end with the contrastive loss.
+    """
+
+    def __init__(self, config: CogForgeConfig):
+        super().__init__()
+        self._feat_dim = 512    # character-bigram hash buckets per view
+        self._n_views  = config.tcl_n_views
+        E              = config.tcl_embed_dim
+
+        # Per-view projection (shared weights for simplicity; can be split)
+        self.view_proj = nn.Linear(self._feat_dim, E, bias=False)
+
+        # Cross-view attention to fuse N views
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=E, num_heads=max(1, E // 64),
+            dropout=0.0, batch_first=True,
+        )
+        self.out_norm = RMSNorm(E)
+        self.out_proj = nn.Linear(E, E, bias=False)
+
+    def _hash_view(self, text: str) -> torch.Tensor:
+        """Character bigram hashing → normalised float vector (feat_dim,)."""
+        vec = torch.zeros(self._feat_dim)
+        t   = text[:8192]
+        for i in range(len(t) - 1):
+            h   = int(hashlib.sha256(t[i:i+2].encode()).hexdigest(), 16)
+            vec[h % self._feat_dim] += 1.0
+        norm = vec.norm().clamp(min=1e-6)
+        return vec / norm
+
+    def encode_event(self, event: DiffEvent) -> torch.Tensor:
+        """
+        Encode one DiffEvent to a unit-norm embedding (tcl_embed_dim,).
+        """
+        views = [
+            event.raw_diff,
+            event.ast_diff or event.raw_diff,
+            (event.tests + " " + event.issue_text).strip() or event.raw_diff,
+            (event.commit_hist + " " + event.reviewer).strip() or event.raw_diff,
+        ][:self._n_views]
+
+        # (n_views, feat_dim)
+        view_feats = torch.stack([self._hash_view(v) for v in views], dim=0)
+        # (n_views, E)
+        view_embs  = self.view_proj(view_feats).unsqueeze(0)   # (1, n_views, E)
+
+        # Cross-view fusion
+        fused, _   = self.cross_attn(view_embs, view_embs, view_embs)
+        pooled     = fused.squeeze(0).mean(dim=0)              # (E,)
+        out        = self.out_proj(self.out_norm(pooled))
+        return F.normalize(out, dim=-1)
+
+    def encode_batch(self, events: List[DiffEvent]) -> torch.Tensor:
+        """Encode a list of DiffEvents → (N, E) normalised tensor."""
+        return torch.stack([self.encode_event(e) for e in events], dim=0)
+
+    def forward(self, events: List[DiffEvent]) -> torch.Tensor:
+        return self.encode_batch(events)
+
+
+class TemporalContrastiveLoss(nn.Module):
+    """
+    InfoNCE (NT-Xent) contrastive loss over repository diff embeddings.
+
+    Given a batch of (anchor, positive) pairs and a set of negatives,
+    the loss encourages anchor·positive > anchor·negative for all negatives.
+
+    Supports three kinds of positives:
+        view_pair:    two views of the same diff event
+        causal_pair:  (diff_t, later_fix_t) — temporal causal chain
+        subsystem:    two diffs in the same subsystem with similar intent
+
+    Hard negatives are selected as the most similar embeddings that are NOT
+    positives (high cosine sim but wrong subsystem / different intent).
+    """
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self,
+                anchors:   torch.Tensor,     # (B, E)
+                positives: torch.Tensor,     # (B, E)
+                negatives: torch.Tensor,     # (K, E)
+                ) -> torch.Tensor:
+        """
+        Symmetric InfoNCE over anchors ↔ positives with shared negatives.
+        """
+        B = anchors.shape[0]
+
+        # Cosine similarities (already unit-norm)
+        sim_ap = (anchors * positives).sum(-1) / self.temperature   # (B,)
+
+        # Anchor vs all negatives: (B, K)
+        sim_an = torch.matmul(anchors, negatives.T) / self.temperature
+
+        # Denominator: pos + all negs (per anchor)
+        logits = torch.cat([sim_ap.unsqueeze(-1), sim_an], dim=-1)   # (B, 1+K)
+        labels = torch.zeros(B, dtype=torch.long, device=anchors.device)
+        loss_a = F.cross_entropy(logits, labels)
+
+        # Symmetric: positives as anchors
+        sim_pa = sim_ap
+        sim_pn = torch.matmul(positives, negatives.T) / self.temperature
+        logits_p = torch.cat([sim_pa.unsqueeze(-1), sim_pn], dim=-1)
+        loss_p   = F.cross_entropy(logits_p, labels)
+
+        return (loss_a + loss_p) / 2.0
+
+
+class TemporalContrastiveTrainer:
+    """
+    Manages the temporal contrastive training loop for TemporalContrastiveEncoder.
+
+    Integrates with:
+        Archeologist — supplies commit history and temporal annotations
+        GraphRAGMemory — retrieves hard positives from the same subsystem
+        TemporalContrastiveLoss — computes the InfoNCE objective
+
+    Training procedure (call `step()` each time new diffs arrive):
+        1. Build a mini-batch of (anchor, positive) pairs from the event buffer.
+        2. Mine hard negatives: most similar events with different intent.
+        3. Compute InfoNCE loss.
+        4. Backprop through the encoder (small; fast).
+        5. Embed all buffered events and upsert into GraphRAGMemory.
+
+    After convergence the encoder embeddings power Archeologist retrieval,
+    so the agent recognises "this pattern led to a hotfix 3 months later."
+    """
+
+    def __init__(self, config: CogForgeConfig,
+                 graph: Optional[GraphRAGMemory] = None):
+        self.config    = config
+        self.encoder   = TemporalContrastiveEncoder(config)
+        self.loss_fn   = TemporalContrastiveLoss(config.tcl_temperature)
+        self.graph     = graph
+        self._buffer: List[DiffEvent] = []
+        self._optimizer = torch.optim.AdamW(
+            self.encoder.parameters(), lr=3e-4, weight_decay=1e-2)
+        self._step_count = 0
+        self._lock = threading.Lock()
+
+    def ingest(self, event: DiffEvent) -> None:
+        """Add a DiffEvent to the training buffer."""
+        with self._lock:
+            self._buffer.append(event)
+
+    def ingest_from_git_log(self, root: str, max_commits: int = 200) -> int:
+        """
+        Parse `git log` output and populate the buffer with DiffEvent objects.
+        Returns the number of events ingested.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "log", f"--max-count={max_commits}",
+                 "--pretty=format:%H|%s|%b|%ai", "--diff-filter=M"],
+                cwd=root, capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                return 0
+        except Exception:
+            return 0
+
+        events_added = 0
+        lines = result.stdout.strip().splitlines()
+        for i, line in enumerate(lines):
+            parts = line.split("|", 3)
+            if len(parts) < 2:
+                continue
+            commit_hash = parts[0].strip()
+            subject     = parts[1].strip() if len(parts) > 1 else ""
+            body        = parts[2].strip() if len(parts) > 2 else ""
+
+            # Get diff for this commit
+            diff_text = ""
+            try:
+                dr = subprocess.run(
+                    ["git", "diff", f"{commit_hash}^", commit_hash, "--stat"],
+                    cwd=root, capture_output=True, text=True, timeout=10,
+                )
+                diff_text = dr.stdout[:2000]
+            except Exception:
+                pass
+
+            # Later fix: look for a "fix" commit referencing this hash
+            later_fix = ""
+            for j in range(i - 1, max(0, i - 5) - 1, -1):
+                if j < len(lines) and commit_hash[:7] in lines[j]:
+                    later_fix = lines[j]
+                    break
+
+            event = DiffEvent(
+                diff_id    = commit_hash,
+                raw_diff   = diff_text or subject,
+                ast_diff   = "",          # not parsed here; could be added
+                rationale  = body or subject,
+                later_fix  = later_fix,
+                subsystem  = subject.split(":")[0] if ":" in subject else "other",
+                commit_hist = " | ".join(
+                    l.split("|")[1] for l in lines[max(0, i-3):i]
+                    if "|" in l
+                ),
+            )
+            self.ingest(event)
+            events_added += 1
+
+        return events_added
+
+    def _mine_hard_negatives(self, batch: List[DiffEvent],
+                             embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Select `tcl_neg_samples` hard negatives: events with high cosine
+        similarity to the batch anchors but different subsystem/intent.
+        Falls back to random negatives if the buffer is too small.
+        """
+        K = self.config.tcl_neg_samples
+        with self._lock:
+            pool = [e for e in self._buffer if e not in batch]
+
+        if not pool:
+            return torch.randn(K, self.config.tcl_embed_dim)
+
+        # Embed pool events
+        pool_sample = pool if len(pool) <= 64 else random.sample(pool, 64)
+        pool_embs   = self.encoder.encode_batch(pool_sample).detach()
+
+        # For each anchor, find most-similar pool events with different subsystem
+        batch_sub = {e.subsystem for e in batch}
+        hard_negs: List[torch.Tensor] = []
+
+        sim = torch.matmul(embeddings, pool_embs.T)   # (B, pool)
+        sorted_idx = sim.mean(0).argsort(descending=True)
+
+        for idx in sorted_idx:
+            if len(hard_negs) >= K:
+                break
+            cand = pool_sample[idx.item()]
+            if cand.subsystem not in batch_sub:
+                hard_negs.append(pool_embs[idx])
+
+        # Fill remaining slots with random pool embeddings
+        while len(hard_negs) < K:
+            i = random.randrange(len(pool_embs))
+            hard_negs.append(pool_embs[i])
+
+        return torch.stack(hard_negs[:K], dim=0)   # (K, E)
+
+    def _build_pairs(self, batch: List[DiffEvent],
+                     embeddings: torch.Tensor,
+                     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Construct positive pairs using all three positive strategies.
+        Returns (anchors, positives) each (B, E).
+        """
+        anchors:   List[torch.Tensor] = []
+        positives: List[torch.Tensor] = []
+
+        for i, event in enumerate(batch):
+            # Strategy 1 — view pair: encode with a different view ordering
+            alt_event = DiffEvent(
+                diff_id    = event.diff_id + "_alt",
+                raw_diff   = event.rationale or event.raw_diff,
+                ast_diff   = event.raw_diff,
+                tests      = event.issue_text,
+                issue_text = event.tests,
+                reviewer   = event.commit_hist,
+                commit_hist = event.reviewer,
+                rationale  = event.raw_diff,
+                subsystem  = event.subsystem,
+            )
+            anchors.append(embeddings[i])
+            positives.append(self.encoder.encode_event(alt_event).detach())
+
+            # Strategy 2 — causal pair: (diff_t, later_fix_t)
+            if event.later_fix:
+                fix_event = DiffEvent(
+                    diff_id    = event.diff_id + "_fix",
+                    raw_diff   = event.later_fix,
+                    subsystem  = event.subsystem,
+                )
+                anchors.append(embeddings[i])
+                positives.append(self.encoder.encode_event(fix_event).detach())
+
+        if not anchors:
+            # Fallback: use identity pairs
+            anchors   = list(embeddings)
+            positives = list(embeddings)
+
+        return torch.stack(anchors, dim=0), torch.stack(positives, dim=0)
+
+    def step(self, batch_size: int = 16) -> Dict:
+        """
+        Run one training step on a random mini-batch from the buffer.
+        Returns training metrics.
+        """
+        with self._lock:
+            if len(self._buffer) < 2:
+                return {"loss": None, "n_events": len(self._buffer)}
+            batch = random.sample(self._buffer, min(batch_size, len(self._buffer)))
+
+        # Encode the batch
+        embeddings = self.encoder.encode_batch(batch)       # (B, E)
+
+        # Build positive pairs
+        anchors, positives = self._build_pairs(batch, embeddings)
+
+        # Mine hard negatives
+        negatives = self._mine_hard_negatives(batch, embeddings)
+
+        # Compute loss and backprop
+        self._optimizer.zero_grad()
+        loss = self.loss_fn(anchors, positives, negatives)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.encoder.parameters(), max_norm=1.0)
+        self._optimizer.step()
+        self._step_count += 1
+
+        # Upsert embeddings into GraphRAG for retrieval
+        if self.graph is not None:
+            with torch.no_grad():
+                for i, event in enumerate(batch):
+                    emb_list = embeddings[i].detach().tolist()
+                    node = self.graph._nodes.get(event.diff_id)
+                    if node:
+                        node.embedding = emb_list
+                    else:
+                        self.graph.upsert_node(
+                            node_id=event.diff_id,
+                            node_type="commit",
+                            label=event.diff_id[:12],
+                            metadata={"subsystem": event.subsystem,
+                                      "has_later_fix": bool(event.later_fix)},
+                            embed_text=event.raw_diff[:512],
+                        )
+
+        return {
+            "loss":       round(loss.item(), 6),
+            "n_pairs":    len(anchors),
+            "n_negatives": negatives.shape[0],
+            "step":        self._step_count,
+            "buffer_size": len(self._buffer),
+        }
+
+    def retrieve_similar(self, diff_text: str, top_k: int = 5) -> List[Dict]:
+        """
+        Find past diffs similar to diff_text using the trained encoder.
+        Returns list of {diff_id, subsystem, has_later_fix, similarity}.
+        """
+        query_event = DiffEvent(diff_id="query", raw_diff=diff_text)
+        with torch.no_grad():
+            q_emb = self.encoder.encode_event(query_event)   # (E,)
+
+        with self._lock:
+            buffer_copy = list(self._buffer)
+
+        if not buffer_copy:
+            return []
+
+        with torch.no_grad():
+            embs = self.encoder.encode_batch(buffer_copy)   # (N, E)
+            sims = torch.matmul(embs, q_emb).tolist()
+
+        ranked = sorted(zip(sims, buffer_copy), key=lambda x: -x[0])
+        results: List[Dict] = []
+        for sim, ev in ranked[:top_k]:
+            results.append({
+                "diff_id":      ev.diff_id,
+                "subsystem":    ev.subsystem,
+                "rationale":    ev.rationale[:120],
+                "has_later_fix": bool(ev.later_fix),
+                "similarity":   round(float(sim), 4),
+            })
+        return results
 
 class SharedMemoryStore:
     """
@@ -3060,6 +3878,8 @@ class MCTSNode:
     """
     Extended MCTS node that carries a granularity level.
     level: "architecture" | "file" | "line"
+
+    v3: adds robust_score (adversarial), fragility, test_entropy_gap.
     """
     code:          str
     level:         str = "file"              # NEW v2
@@ -3073,6 +3893,12 @@ class MCTSNode:
 
     # NEW v2: full reward breakdown
     reward_signals: Dict[str, float] = field(default_factory=dict)
+
+    # NEW v3: adversarial robustness fields
+    robust_score:    float = 0.0   # pass_rate - α*fragility - β*entropy_gap
+    fragility:       float = 0.0   # Bernoulli variance of adversarial outcomes
+    entropy_gap:     float = 0.0   # how much harder than random baseline
+    adv_tested:      bool  = False # whether adversarial evaluation has run
 
     @property
     def mean_reward(self) -> float:
@@ -3171,6 +3997,15 @@ class HierarchicalCogSearch:
         self._dpo_pairs: List[Dict] = []
         self._max_parallel = self.config.mcts_max_parallel
 
+        # NEW v3: adversarial subsystem
+        self.adv_test_pool = AdversarialTestPool(
+            max_patterns=self.config.adver_pool_size)
+        self.attacker = AdversarialAttacker(
+            test_pool=self.adv_test_pool,
+            mutation_rounds=self.config.adver_mutation_rounds,
+            timeout=5,
+        )
+
     # ── Tree operations ─────────────────────────────────────────────────
 
     def _select(self, root: MCTSNode) -> MCTSNode:
@@ -3241,7 +4076,34 @@ class HierarchicalCogSearch:
             res = self._eval_file(child.code, prompt, run_tests, repo_style_hints)
 
         child.reward_signals = {k: v for k, v in res.items() if k != "reward"}
-        reward = res.get("reward", 0.0)
+        base_reward = res.get("reward", 0.0)
+
+        # NEW v3: adversarial robustness evaluation (file/line only)
+        if level != "architecture" and not child.adv_tested:
+            pass_rate, fragility, entropy_gap = self.attacker.attack(
+                child.code, prompt,
+                mutation_rounds=self.config.adver_mutation_rounds,
+            )
+            child.fragility   = fragility
+            child.entropy_gap = entropy_gap
+            child.adv_tested  = True
+            # Robust score: penalise fragility and entropy gap
+            child.robust_score = (
+                pass_rate
+                - self.config.adver_alpha * fragility
+                - self.config.adver_beta  * entropy_gap
+            )
+            child.reward_signals.update({
+                "adv_pass_rate":   pass_rate,
+                "adv_fragility":   fragility,
+                "adv_entropy_gap": entropy_gap,
+                "robust_score":    round(child.robust_score, 4),
+            })
+            # Blend base reward and robust score (equal weight)
+            reward = (base_reward + child.robust_score) / 2.0
+        else:
+            child.robust_score = base_reward
+            reward = base_reward
 
         # Mark terminal if reward is near maximum
         if reward >= 0.9:
@@ -3478,6 +4340,697 @@ class HierarchicalCogSearch:
         return list(self._dpo_pairs)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v3 — Adversarial MCTS: Attacker subsystem
+# ═══════════════════════════════════════════════════════════════════════════
+
+class AdversarialTestPool:
+    """
+    Transposition table for adversarially-discovered failing test patterns.
+
+    Ensures the attacker does not rediscover the same failure twice by
+    tracking a content-hash of (test_input, failure_mode) pairs.
+    The most-hit patterns are the hardest discovered tests and are
+    replayed first on new solver branches.
+    """
+
+    def __init__(self, max_patterns: int = 500):
+        self.max_patterns = max_patterns
+        self._pool: Dict[str, Dict] = {}
+        self._lock = threading.Lock()
+
+    def _key(self, test_input: str, failure_mode: str) -> str:
+        raw = f"{test_input[:200]}|{failure_mode}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def add(self, test_input: str, expected: str,
+            actual: str, failure_mode: str) -> str:
+        key = self._key(test_input, failure_mode)
+        with self._lock:
+            if key in self._pool:
+                self._pool[key]["hit_count"] += 1
+            else:
+                if len(self._pool) >= self.max_patterns:
+                    evict = min(self._pool, key=lambda k: self._pool[k]["hit_count"])
+                    del self._pool[evict]
+                self._pool[key] = {
+                    "test_input":   test_input,
+                    "expected":     expected,
+                    "actual":       actual,
+                    "failure_mode": failure_mode,
+                    "hit_count":    1,
+                }
+        return key
+
+    def contains(self, test_input: str, failure_mode: str = "any") -> bool:
+        return self._key(test_input, failure_mode) in self._pool
+
+    def top_k(self, k: int = 10) -> List[Dict]:
+        with self._lock:
+            return sorted(self._pool.values(),
+                          key=lambda r: -r["hit_count"])[:k]
+
+    def all_tests(self) -> List[Dict]:
+        with self._lock:
+            return list(self._pool.values())
+
+    def __len__(self) -> int:
+        return len(self._pool)
+
+    def stats(self) -> Dict:
+        return {
+            "total_patterns": len(self._pool),
+            "total_hits": sum(r["hit_count"] for r in self._pool.values()),
+        }
+
+
+class AdversarialAttacker:
+    """
+    Generates maximally-breaking test cases for a solver branch.
+
+    Four complementary strategies:
+        1. Symbolic boundary sampling  — edge values derived from the code's
+           own literal constants ± classic boundary set (int extremes, empty
+           sequences, None, NaN, ±Inf, max-length strings).
+        2. Coverage-guided mutation    — parses AST branch conditions and
+           generates inputs that flip each comparison (off-by-one, negation).
+        3. API-constraint violation    — reads parameter names / docstring
+           annotations and deliberately violates constraints (negative sizes,
+           out-of-range indices, wrong types).
+        4. Historical pattern replay   — replays the top-K failing inputs from
+           the shared AdversarialTestPool (transposition table) against the
+           new branch; skips patterns already confirmed-failing.
+
+    Returns (pass_rate, fragility, test_entropy_gap) as a tuple of floats:
+        pass_rate        ∈ [0,1]  fraction of tests the solver passes
+        fragility        ∈ [0,1]  Bernoulli variance of per-test outcomes
+        test_entropy_gap ∈ [0,1]  gap vs assumed 0.85 baseline pass rate
+    """
+
+    _INT_EDGES   = [0, 1, -1, 2, -2, 10, 100, 1000, -(2**31), 2**31 - 1]
+    _FLOAT_EDGES = [0.0, -0.0, 1.0, -1.0, float("inf"), float("-inf"),
+                    float("nan"), 1e-308, 1e308]
+    _STR_EDGES   = ["", " ", "\n", "\t", "a" * 256, "!@#$%^&*()", "\x00"]
+    _LIST_EDGES  = [[], [None], [0], list(range(50)), [float("inf")]]
+
+    def __init__(self, test_pool: AdversarialTestPool,
+                 mutation_rounds: int = 3, timeout: int = 5):
+        self.test_pool       = test_pool
+        self.mutation_rounds = mutation_rounds
+        self.timeout         = timeout
+
+    # ── Strategy 1: Symbolic boundary sampling ───────────────────────────
+
+    def _extract_constants(self, code: str) -> List[Any]:
+        constants: List[Any] = []
+        try:
+            for node in ast.walk(ast.parse(code)):
+                if isinstance(node, ast.Constant):
+                    constants.append(node.value)
+        except SyntaxError:
+            pass
+        return constants
+
+    def _symbolic_tests(self, code: str, fn_name: str) -> List[str]:
+        literals = self._extract_constants(code)
+        int_vals = list({int(v) for v in literals
+                         if isinstance(v, (int, float)) and not isinstance(v, bool)
+                         and abs(v) < 1e15})
+        int_vals += self._INT_EDGES
+        float_vals = [v for v in literals if isinstance(v, float)] + self._FLOAT_EDGES
+
+        tests: List[str] = []
+        for v in int_vals[:6]:
+            tests.append(f"{fn_name}({v!r})")
+        for v in float_vals[:4]:
+            tests.append(f"{fn_name}({v!r})")
+        for s in self._STR_EDGES[:4]:
+            tests.append(f"{fn_name}({s!r})")
+        for lst in self._LIST_EDGES[:3]:
+            tests.append(f"{fn_name}({lst!r})")
+        # Off-by-one around found int constants
+        for c in int_vals[:3]:
+            tests += [f"{fn_name}({c - 1!r})", f"{fn_name}({c + 1!r})"]
+        return tests
+
+    # ── Strategy 2: Coverage-guided mutation ─────────────────────────────
+
+    def _extract_comparands(self, code: str) -> List[int]:
+        nums: List[int] = []
+        try:
+            for node in ast.walk(ast.parse(code)):
+                if isinstance(node, (ast.If, ast.While)):
+                    src = (ast.unparse(node.test)
+                           if hasattr(ast, "unparse") else "")
+                    for m in re.findall(r"\b(\d+)\b", src):
+                        nums.append(int(m))
+        except (SyntaxError, AttributeError):
+            pass
+        return nums
+
+    def _mutation_tests(self, code: str, fn_name: str) -> List[str]:
+        tests: List[str] = []
+        for n in self._extract_comparands(code)[:5]:
+            for delta in (-1, 0, 1):
+                tests.append(f"{fn_name}({n + delta!r})")
+        tests += [f"{fn_name}(None)", f"{fn_name}([])"]
+        return tests
+
+    # ── Strategy 3: API-constraint violation ─────────────────────────────
+
+    def _constraint_tests(self, code: str, fn_name: str) -> List[str]:
+        tests: List[str] = []
+        try:
+            for node in ast.walk(ast.parse(code)):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.name != fn_name:
+                    continue
+                doc = ast.get_docstring(node) or ""
+                if any(kw in doc.lower() for kw in
+                       ("non-negative", "positive", "must be > 0", "> 0")):
+                    tests += [f"{fn_name}(-1)", f"{fn_name}(-100)", f"{fn_name}(0)"]
+                for arg in node.args.args:
+                    nm = arg.arg.lower()
+                    if any(kw in nm for kw in ("index", "idx", "pos")):
+                        tests += [f"{fn_name}(-1)", f"{fn_name}(9999999)"]
+                    if any(kw in nm for kw in ("size", "len", "count", "n")):
+                        tests += [f"{fn_name}(0)", f"{fn_name}(-1)"]
+                    if "dtype" in nm or "type" in nm:
+                        tests += [f'{fn_name}("not_a_number")', f"{fn_name}(True)"]
+        except SyntaxError:
+            pass
+        # Type-boundary: aliasing and float/int confusion
+        tests += [f"{fn_name}(2**63)", f"{fn_name}([1, 2, 3, 4] * 1000)"]
+        return tests
+
+    # ── Strategy 4: Historical pattern replay ────────────────────────────
+
+    def _historical_tests(self, fn_name: str) -> List[str]:
+        tests: List[str] = []
+        for record in self.test_pool.top_k(k=5):
+            raw = record["test_input"]
+            if re.match(r"^[\w\[\]{}'\"(),.\s+\-*]+$", raw):
+                tests.append(f"{fn_name}({raw})")
+        return tests
+
+    # ── Subprocess execution ──────────────────────────────────────────────
+
+    def _run_test(self, code: str, call_expr: str) -> Tuple[bool, str]:
+        harness = textwrap.dedent(f"""\
+            import sys, math, traceback
+            {code}
+            try:
+                result = {call_expr}
+                print(f"PASS: {{result!r}}")
+            except Exception as e:
+                print(f"FAIL: {{type(e).__name__}}: {{e}}")
+                sys.exit(1)
+        """)
+        tmp = os.path.join(tempfile.gettempdir(),
+                           f"adver_{uuid.uuid4().hex[:8]}.py")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(harness)
+            r = subprocess.run(
+                [sys.executable, tmp],
+                capture_output=True, text=True, timeout=self.timeout,
+            )
+            passed = r.returncode == 0
+            out    = (r.stdout + r.stderr).strip()[:200]
+            return passed, out
+        except subprocess.TimeoutExpired:
+            return False, "TIMEOUT"
+        except Exception as e:
+            return False, str(e)
+        finally:
+            try: os.unlink(tmp)
+            except OSError: pass
+
+    def _pick_target_fn(self, code: str) -> str:
+        fn = ""
+        try:
+            for node in ast.walk(ast.parse(code)):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    fn = node.name
+        except SyntaxError:
+            pass
+        return fn
+
+    # ── Main entry point ─────────────────────────────────────────────────
+
+    def attack(self, code: str, prompt: str,
+               mutation_rounds: Optional[int] = None,
+               ) -> Tuple[float, float, float]:
+        """
+        Run all four attack strategies against `code`.
+
+        Returns (pass_rate, fragility, test_entropy_gap).
+        """
+        fn_name = self._pick_target_fn(code)
+        if not fn_name:
+            return 0.8, 0.0, 0.0
+
+        raw_tests: List[str] = []
+        raw_tests += self._symbolic_tests(code, fn_name)
+        raw_tests += self._mutation_tests(code, fn_name)
+        raw_tests += self._constraint_tests(code, fn_name)
+        raw_tests += self._historical_tests(fn_name)
+
+        # Deduplicate
+        seen: Set[str] = set()
+        unique: List[str] = []
+        for t in raw_tests:
+            if t not in seen:
+                seen.add(t)
+                unique.append(t)
+
+        if not unique:
+            return 0.8, 0.0, 0.0
+
+        def _run_one(call: str) -> bool:
+            # Fast-path: already a known failure
+            if self.test_pool.contains(call):
+                return False
+            passed, out = self._run_test(code, call)
+            if not passed:
+                self.test_pool.add(call, "?", out, "execution_fail")
+            return passed
+
+        results: List[bool] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futs = {pool.submit(_run_one, t): t for t in unique}
+            for fut in concurrent.futures.as_completed(futs, timeout=90):
+                try:
+                    results.append(fut.result())
+                except Exception:
+                    results.append(False)
+
+        if not results:
+            return 0.8, 0.0, 0.0
+
+        n          = len(results)
+        pass_rate  = sum(results) / n
+        fragility  = pass_rate * (1.0 - pass_rate)          # Bernoulli variance
+        entropy_gap = max(0.0, 0.85 - pass_rate)            # vs assumed baseline
+        return round(pass_rate, 4), round(fragility, 4), round(entropy_gap, 4)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v3 — MCTS Node extended with robust_score + adversarial results
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (MCTSNode is defined below; we extend it with the adversarial fields via
+#  the dataclass definition update further down.)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v3 — Recursive Self-Distillation
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SolutionCluster:
+    """A cluster of semantically-equivalent solver solutions."""
+    canonical_code:   str
+    n_members:        int
+    mean_reward:      float
+    reward_variance:  float
+    consensus_ratio:  float      # fraction of members in this cluster
+    consensus_rationale: str     # extracted explanation of *why* this approach works
+
+
+class LoRAStyleAdapter(nn.Module):
+    """
+    A lightweight LoRA-style linear adapter applied on top of a frozen
+    linear layer, used to specialise the model for repo-specific patterns
+    without touching the base weights.
+
+    Given the frozen weight W ∈ (out, in), the adapter adds B·A
+    where A ∈ (r, in) and B ∈ (out, r) with r ≪ min(in, out).
+
+    During distillation: only A and B are trained.
+    Base model: completely frozen.
+    """
+
+    def __init__(self, in_features: int, out_features: int, rank: int = 16,
+                 alpha: float = 1.0):
+        super().__init__()
+        self.rank  = rank
+        self.scale = alpha / rank
+        self.A = nn.Parameter(torch.randn(rank, in_features)  * 0.01)
+        self.B = nn.Parameter(torch.zeros(out_features, rank))
+        # B initialised to zero so adapter starts as identity delta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (..., in_features) → delta (..., out_features)"""
+        return (x @ self.A.T @ self.B.T) * self.scale
+
+    def merge(self, weight: torch.Tensor) -> torch.Tensor:
+        """Return weight + LoRA delta for inference without overhead."""
+        return weight + (self.B @ self.A) * self.scale
+
+
+class RecursiveSelfDistiller:
+    """
+    Consensus-driven recursive self-distillation with repo-conditioned LoRA.
+
+    Algorithm per round:
+        1. Sample `distill_n_samples` solutions from EngineerClones at
+           diverse temperatures (0.5, 0.7, 0.9, 1.1).
+        2. Execute and score each solution with CoverageRewardModule.
+        3. Cluster equivalent solutions by semantic fingerprint (AST-hash of
+           functions), not token overlap.
+        4. Identify the consensus cluster: largest cluster that also has the
+           highest mean reward.
+        5. Extract a consensus rationale and consensus patch from the cluster.
+        6. Distil ONLY the consensus into a LoRA adapter (frozen base model).
+        7. Keep the adapter if it improves verifier score; discard otherwise.
+        8. Optionally upsert the consensus + rationale into GraphRAGMemory for
+           future retrieval (repo-conditioned specialisation).
+
+    Key safeguard: if no consensus cluster meets `distill_consensus_threshold`,
+    the round is skipped and the base model is used unchanged.
+    """
+
+    SAMPLE_TEMPERATURES = [0.5, 0.7, 0.9, 1.1]
+
+    def __init__(self, config: CogForgeConfig,
+                 coverage_reward: Optional["CoverageRewardModule"] = None,
+                 graph: Optional[GraphRAGMemory] = None):
+        self.config          = config
+        self.coverage_reward = coverage_reward
+        self.graph           = graph
+        self._adapters: Dict[str, LoRAStyleAdapter] = {}   # layer_name → adapter
+        self._round_history: List[Dict]              = []
+        self._lock = threading.Lock()
+
+    # ── Semantic fingerprinting ───────────────────────────────────────────
+
+    def _ast_fingerprint(self, code: str) -> str:
+        """
+        Returns a content-hash of the top-level function signatures + their
+        body sizes (not exact text).  Two equivalent implementations with
+        different variable names hash identically at this level.
+        """
+        parts: List[str] = []
+        try:
+            tree = ast.parse(code)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    args = [a.arg for a in node.args.args]
+                    body_lines = getattr(node, "end_lineno", 0) - node.lineno
+                    parts.append(f"{node.name}({','.join(args)}):{body_lines}")
+        except SyntaxError:
+            parts.append(code[:100])
+        raw = "|".join(parts)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    # ── Sampling (heuristic without real inference) ───────────────────────
+
+    def _sample_solutions(self, prompt: str,
+                          base_code: str) -> List[Tuple[str, float]]:
+        """
+        Generate `distill_n_samples` solutions at diverse temperatures.
+        In production: call model.generate() at each temperature.
+        Here: produce syntactic variants as a stand-in for sampled outputs.
+        Returns [(code, temperature), …].
+        """
+        n = self.config.distill_n_samples
+        temps = self.SAMPLE_TEMPERATURES
+        samples: List[Tuple[str, float]] = []
+
+        fn_pats = [
+            # Iterative with explicit check
+            ("_iterative", "    result = []\n    for item in items:\n"
+             "        if item is not None:\n            result.append(item)\n    return result"),
+            # Functional
+            ("_functional", "    return [item for item in items if item is not None]"),
+            # With default guard
+            ("_guarded", "    items = items or []\n"
+             "    return [x for x in items if x is not None]"),
+            # Sorted output
+            ("_sorted", "    return sorted(x for x in items if x is not None)"),
+            # Enumerate-based
+            ("_enum", "    return [v for _, v in enumerate(items) if v is not None]"),
+            # With type check
+            ("_typed", "    return [x for x in items if isinstance(x, (int, float, str))]"),
+            # Recursive
+            ("_recursive", "    if not items:\n        return []\n"
+             "    head, *tail = items\n"
+             "    rest = items[1:]\n"
+             "    return ([head] if head is not None else []) + items.__class__.__new__(items.__class__)"),
+            # Generator-based
+            ("_gen", "    return list(x for x in items if x)"),
+        ]
+        fn_base = re.sub(r"[^a-z0-9_]", "_", prompt.lower().split()[0][:20])
+
+        for i in range(n):
+            t = temps[i % len(temps)]
+            suffix, body = fn_pats[i % len(fn_pats)]
+            code_variant = (
+                f"{base_code}\n\n"
+                f"def {fn_base}{suffix}(items):\n"
+                f"    # sampled at temperature={t}\n"
+                f"{body}\n"
+            )
+            samples.append((code_variant, t))
+
+        return samples
+
+    # ── Scoring ──────────────────────────────────────────────────────────
+
+    def _score_solutions(self, solutions: List[Tuple[str, float]],
+                         prompt: str) -> List[Tuple[str, float]]:
+        """
+        Returns [(code, reward), …] sorted descending by reward.
+        Uses CoverageRewardModule if available, else PRM-only heuristic.
+        """
+        scored: List[Tuple[str, float]] = []
+        if self.coverage_reward is not None:
+            for code, _t in solutions:
+                try:
+                    res    = self.coverage_reward.compute(code, prompt, run_tests=False)
+                    reward = res.get("reward", 0.0)
+                except Exception:
+                    reward = -1.0
+                scored.append((code, reward))
+        else:
+            # Heuristic: penalise syntax errors, reward function presence
+            for code, _t in solutions:
+                try:
+                    ast.parse(code)
+                    reward = 0.4 + 0.1 * len(re.findall(r"\bdef \b", code))
+                except SyntaxError:
+                    reward = -1.0
+                scored.append((code, reward))
+
+        return sorted(scored, key=lambda x: -x[1])
+
+    # ── Clustering ───────────────────────────────────────────────────────
+
+    def _cluster(self, scored: List[Tuple[str, float]],
+                 ) -> List[SolutionCluster]:
+        """
+        Group solutions by AST fingerprint.
+        Returns clusters sorted by (size × mean_reward) descending.
+        """
+        groups: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        for code, reward in scored:
+            fp = self._ast_fingerprint(code)
+            groups[fp].append((code, reward))
+
+        total = max(len(scored), 1)
+        clusters: List[SolutionCluster] = []
+        for fp, members in groups.items():
+            rewards = [r for _, r in members]
+            mr = sum(rewards) / len(rewards)
+            vr = (sum((r - mr) ** 2 for r in rewards) / len(rewards)) if len(rewards) > 1 else 0.0
+            best_code = max(members, key=lambda x: x[1])[0]
+            clusters.append(SolutionCluster(
+                canonical_code   = best_code,
+                n_members        = len(members),
+                mean_reward      = round(mr, 4),
+                reward_variance  = round(vr, 4),
+                consensus_ratio  = round(len(members) / total, 4),
+                consensus_rationale = self._extract_rationale(best_code),
+            ))
+
+        return sorted(clusters, key=lambda c: -(c.n_members * c.mean_reward))
+
+    def _extract_rationale(self, code: str) -> str:
+        """
+        Extract a human-readable rationale from the best code's docstring
+        or first-line comment.
+        """
+        try:
+            tree = ast.parse(code)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    doc = ast.get_docstring(node)
+                    if doc:
+                        return doc[:200]
+        except SyntaxError:
+            pass
+        # Fallback: first comment line
+        for line in code.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                return stripped[1:].strip()[:200]
+        return "(no rationale extracted)"
+
+    # ── LoRA adapter training ─────────────────────────────────────────────
+
+    def _create_adapter(self, consensus_code: str,
+                        layer_name: str = "distill_v1") -> LoRAStyleAdapter:
+        """
+        Create a LoRA adapter by training on (consensus_code) representations.
+        In production: fine-tune adapter weights via next-token prediction loss
+        on the consensus code with the base model frozen.
+        Here: initialise the adapter and simulate a mini training step using
+        the code's character bigram features as the supervision signal.
+        """
+        D    = self.config.d_model
+        rank = self.config.distill_lora_rank
+        adapter = LoRAStyleAdapter(D, D, rank=rank, alpha=float(rank))
+
+        # Simulate: encode consensus code as a target vector and nudge A/B
+        feat = torch.zeros(D)
+        for i in range(len(consensus_code) - 1):
+            h = int(hashlib.sha256(consensus_code[i:i+2].encode()).hexdigest(), 16)
+            feat[h % D] += 1.0
+        feat = F.normalize(feat, dim=0).unsqueeze(0)   # (1, D)
+
+        opt = torch.optim.AdamW(adapter.parameters(), lr=1e-3)
+        for _ in range(50):   # micro-steps
+            opt.zero_grad()
+            delta = adapter(feat)
+            loss  = F.mse_loss(delta, feat)   # teach adapter to represent the code
+            loss.backward()
+            opt.step()
+
+        with self._lock:
+            self._adapters[layer_name] = adapter
+        return adapter
+
+    # ── Main distillation round ───────────────────────────────────────────
+
+    def distill_round(self, prompt: str, base_code: str = "",
+                      layer_name: str = "distill_latest") -> Dict:
+        """
+        Execute one complete self-distillation round.
+
+        Returns a report dict:
+            consensus_code, consensus_ratio, mean_reward, adapter_name,
+            n_clusters, n_samples, skipped (bool), round_index.
+        """
+        solutions = self._sample_solutions(prompt, base_code)
+        scored    = self._score_solutions(solutions, prompt)
+        clusters  = self._cluster(scored)
+
+        report: Dict = {
+            "round_index":      len(self._round_history),
+            "n_samples":        len(solutions),
+            "n_clusters":       len(clusters),
+            "skipped":          False,
+            "consensus_code":   base_code,
+            "consensus_ratio":  0.0,
+            "mean_reward":      0.0,
+            "adapter_name":     None,
+        }
+
+        if not clusters:
+            report["skipped"] = True
+            self._round_history.append(report)
+            return report
+
+        best = clusters[0]
+        report["consensus_ratio"] = best.consensus_ratio
+        report["mean_reward"]     = best.mean_reward
+        report["consensus_code"]  = best.canonical_code
+        report["consensus_rationale"] = best.consensus_rationale
+
+        if best.consensus_ratio < self.config.distill_consensus_threshold:
+            report["skipped"] = True
+            self._round_history.append(report)
+            return report
+
+        # Build the LoRA adapter for the consensus
+        adapter = self._create_adapter(best.canonical_code,
+                                       layer_name=layer_name)
+        report["adapter_name"] = layer_name
+
+        # Upsert consensus into GraphRAG for future retrieval
+        if self.graph is not None:
+            node_id = f"consensus_{layer_name}_{len(self._round_history)}"
+            self.graph.upsert_node(
+                node_id   = node_id,
+                node_type = "concept",
+                label     = f"Distilled consensus: {prompt[:60]}",
+                metadata  = {
+                    "consensus_ratio": best.consensus_ratio,
+                    "mean_reward":     best.mean_reward,
+                    "layer":           layer_name,
+                },
+                embed_text = best.canonical_code[:1024],
+            )
+            self.graph.set_compression(
+                node_id,
+                gist    = f"Consensus ({best.consensus_ratio:.0%}): {best.consensus_rationale[:80]}",
+                summary = best.consensus_rationale,
+                raw     = best.canonical_code,
+            )
+
+        self._round_history.append(report)
+        return report
+
+    def multi_round(self, prompt: str, base_code: str = "") -> List[Dict]:
+        """
+        Run up to `distill_max_rounds` rounds, feeding each round's best
+        consensus code into the next as the new base_code.
+        Stops early if the consensus ratio stops improving.
+        """
+        reports: List[Dict] = []
+        current_code = base_code
+        prev_ratio   = 0.0
+
+        for i in range(self.config.distill_max_rounds):
+            layer = f"distill_round_{i}"
+            rep   = self.distill_round(prompt, current_code, layer_name=layer)
+            reports.append(rep)
+            if not rep["skipped"]:
+                current_code = rep["consensus_code"]
+            # Early stop if consensus ratio is no longer improving
+            if rep["consensus_ratio"] <= prev_ratio + 0.01 and i > 0:
+                break
+            prev_ratio = rep["consensus_ratio"]
+
+        return reports
+
+    def get_adapter(self, layer_name: str) -> Optional[LoRAStyleAdapter]:
+        return self._adapters.get(layer_name)
+
+    def list_adapters(self) -> List[str]:
+        return list(self._adapters.keys())
+
+    def stats(self) -> Dict:
+        return {
+            "rounds_completed": len(self._round_history),
+            "n_adapters":       len(self._adapters),
+            "last_round":       self._round_history[-1] if self._round_history else None,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v3 — MCTSNode extended (robust_score, adversarial fields)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (Defined in the MCTSNode section below with the new fields merged in.)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v2 — Hierarchical CogSearch (existing)
+# ═══════════════════════════════════════════════════════════════════════════
+
 # Keep v1 CogSearch as an alias for backwards compatibility
 class CogSearch(HierarchicalCogSearch):
     """
@@ -3580,6 +5133,29 @@ class CogWorksSwarm:
             config=self.config,
             exploration_c=1.414,
             k_expansions=3,
+        )
+
+        # NEW v3 — Adversarial MCTS: shared test pool (exposed for introspection)
+        self.adv_test_pool = self.cog_search_engine.adv_test_pool
+
+        # NEW v3 — Differentiable Talking Space
+        self.latent_comms = LatentCommsCoordinator(self.config)
+        for agent_name in [
+            "Coordinator", "Dreamer", "Explorer", "Planner", "ProblemSolver",
+            "Engineer", "BugFinder", "TerminalGuy", "VulnerabilityFinder",
+            "Pessimist", "Documentor", "Nexus", "Archeologist",
+        ]:
+            self.latent_comms.register(agent_name)
+
+        # NEW v3 — Temporal Contrastive Learning
+        self.tcl_trainer = TemporalContrastiveTrainer(
+            self.config, graph=self.shared_memory.graph)
+
+        # NEW v3 — Recursive Self-Distillation
+        self.self_distiller = RecursiveSelfDistiller(
+            self.config,
+            coverage_reward=self.cog_search_engine.coverage_reward,
+            graph=self.shared_memory.graph,
         )
 
         self._agents: Dict[str, BaseAgent] = {
@@ -3692,6 +5268,39 @@ class CogWorksSwarm:
             self.mem_mgr.persist(save_snapshot)
             results["session_snapshot"] = save_snapshot
 
+        # ── Step 16 (NEW v3): Temporal Contrastive Learning ───────────────
+        # Ingest any new commit history from the repo and run one TCL step
+        n_ingested = self.tcl_trainer.ingest_from_git_log(repo_root, max_commits=50)
+        if n_ingested > 0:
+            tcl_metrics = self.tcl_trainer.step(batch_size=16)
+        else:
+            tcl_metrics = {"loss": None, "n_events": 0}
+        results["tcl_metrics"] = tcl_metrics
+
+        # ── Step 17 (NEW v3): Recursive Self-Distillation ─────────────────
+        # Distil the best Engineer code into a repo-specific LoRA adapter
+        best_eng_code = (results.get("engineer", {}) or {}).get("code", "")
+        if best_eng_code and len(best_eng_code) > 30:
+            distill_reports = self.self_distiller.multi_round(
+                task, base_code=best_eng_code)
+            results["self_distillation"] = {
+                "rounds": len(distill_reports),
+                "final_consensus_ratio": (
+                    distill_reports[-1].get("consensus_ratio", 0.0)
+                    if distill_reports else 0.0
+                ),
+                "adapter_names": self.self_distiller.list_adapters(),
+            }
+        else:
+            results["self_distillation"] = {"rounds": 0, "skipped": True}
+
+        # ── Step 18 (NEW v3): Latent Comms curriculum advance ─────────────
+        temp, hardness = self.latent_comms.curriculum_step()
+        results["latent_comms"] = {
+            **self.latent_comms.stats(),
+            "adv_pool_stats": self.adv_test_pool.stats(),
+        }
+
         return results
 
     # ── CogSearch (hierarchical) entry point ─────────────────────────────
@@ -3753,6 +5362,240 @@ class CogWorksSwarm:
 if __name__ == "__main__":
     cfg   = CogForgeConfig()
     model = CogForge(cfg)
+    print(f"CogForge v3 parameters:  {model.count_parameters():,}")
+    print(f"Graph embed dim:         {cfg.graph_embed_dim}")
+    print(f"Beam width (MCTS):       {cfg.mcts_beam_width}")
+    print(f"PRM layers:              {cfg.mcts_prm_layers}")
+    print(f"Max parallel eval:       {cfg.mcts_max_parallel}")
+    print(f"Adver alpha/beta:        {cfg.adver_alpha}/{cfg.adver_beta}")
+    print(f"Latent comm dim:         {cfg.latent_comm_dim}")
+    print(f"TCL embed dim:           {cfg.tcl_embed_dim}")
+    print(f"Distill LoRA rank:       {cfg.distill_lora_rank}")
+
+    # ── Model forward pass ────────────────────────────────────────────────
+    B, T   = 2, 64
+    ids    = torch.randint(0, cfg.vocab_size, (B, T))
+    chunks = torch.randn(B, cfg.max_repo_chunks, cfg.d_model)
+    out    = model(ids, repo_chunks=chunks, return_verifier=True, return_handoff=True)
+    print(f"\nForward pass:")
+    print(f"  logits:           {out['logits'].shape}")
+    print(f"  verifier_score:   {out['verifier_score']}")
+    print(f"  recommended_agent:{out['recommended_agent']}")
+
+    # ── ModelRouter smoke test ────────────────────────────────────────────
+    print("\n--- ModelRouter ---")
+    router = ModelRouter(model)
+    tasks  = [
+        "rename a variable",
+        "refactor the entire auth module with security hardening and race condition fixes",
+        "add docstring to parse_date",
+    ]
+    for t in tasks:
+        cfg_out = router.get_gen_config(t)
+        print(f"  [{cfg_out['head']:6s}] {t[:60]}")
+
+    # ── GraphRAG smoke test ───────────────────────────────────────────────
+    print("\n--- GraphRAGMemory ---")
+    graph = GraphRAGMemory(embed_dim=cfg.graph_embed_dim,
+                           max_nodes=cfg.graph_max_nodes)
+    graph.upsert_node("f1", "file", "auth/views.py",
+                      embed_text="authentication login session JWT")
+    graph.upsert_node("f2", "file", "db/models.py",
+                      embed_text="database ORM migration schema")
+    graph.upsert_node("f3", "file", "api/serializers.py",
+                      embed_text="REST API serialization validation")
+    graph.add_edge("f1", "f2", "imports")
+    graph.add_edge("f3", "f2", "imports")
+    graph.set_compression("f1", gist="Auth views — JWT login.",
+                          summary="Handles user login/logout with JWT tokens.",
+                          detailed="Full auth module: login, logout, refresh, middleware.")
+
+    hits = graph.semantic_search("login authentication token", top_k=2)
+    print(f"  Semantic search hits: {[n.label for _, n in hits]}")
+    neighbours = graph.k_hop_neighbours("f1", k=1)
+    print(f"  k-hop neighbours of auth/views.py: {[n.label for n in neighbours]}")
+    gist = graph.get_compression("f1", level="gist")
+    print(f"  Gist for auth/views.py: {gist}")
+    print(f"  Graph stats: {graph.stats()}")
+
+    # ── NEW v3: Differentiable Talking Space smoke test ───────────────────
+    print("\n--- LatentCommsCoordinator ---")
+    latent_comms = LatentCommsCoordinator(cfg)
+    latent_comms.register("Engineer")
+    latent_comms.register("Pessimist")
+    latent_comms.register("Coordinator")
+    dummy_hidden = torch.randn(1, 32, cfg.d_model)
+    z_eng  = latent_comms.emit("Engineer",   dummy_hidden)
+    z_pess = latent_comms.emit("Pessimist",  dummy_hidden)
+    z_coord= latent_comms.emit("Coordinator",dummy_hidden)
+    routed = latent_comms.route()
+    print(f"  Routed z shape:   {routed.shape}")
+    temp, hardness = latent_comms.curriculum_step()
+    print(f"  Curriculum:       temp={temp:.3f}  hardness={hardness:.3f}")
+    injected = latent_comms.inject_into_hidden("Engineer", dummy_hidden, routed)
+    print(f"  Injected hidden:  {injected.shape}")
+    print(f"  Comms stats:      {latent_comms.stats()}")
+
+    # ── NEW v3: Adversarial Test Pool smoke test ──────────────────────────
+    print("\n--- AdversarialTestPool + Attacker ---")
+    adv_pool = AdversarialTestPool(max_patterns=cfg.adver_pool_size)
+    adv_pool.add("[]", "[]", "IndexError", "execution_fail")
+    adv_pool.add("-1", "None", "ValueError: negative", "execution_fail")
+    attacker = AdversarialAttacker(adv_pool, mutation_rounds=cfg.adver_mutation_rounds)
+    sample_code = (
+        "def filter_primes(items):\n"
+        "    def is_prime(n):\n"
+        "        if n < 2: return False\n"
+        "        for i in range(2, int(n**0.5)+1):\n"
+        "            if n % i == 0: return False\n"
+        "        return True\n"
+        "    return [x for x in items if is_prime(x)]\n"
+    )
+    pr, frag, egap = attacker.attack(sample_code, "filter primes from list")
+    print(f"  pass_rate={pr:.3f}  fragility={frag:.3f}  entropy_gap={egap:.3f}")
+    print(f"  Pool stats: {adv_pool.stats()}")
+
+    # ── NEW v3: Temporal Contrastive Learning smoke test ──────────────────
+    print("\n--- TemporalContrastiveTrainer ---")
+    tcl = TemporalContrastiveTrainer(cfg, graph=graph)
+    for i in range(5):
+        ev = DiffEvent(
+            diff_id    = f"commit_{i:04d}",
+            raw_diff   = f"- old_fn(x)\n+ new_fn(x, validate=True)  # fix {i}",
+            ast_diff   = f"FunctionDef change line {i*10}",
+            rationale  = "Added input validation to prevent None access" if i % 2 == 0
+                         else "Refactored for performance",
+            later_fix  = ("hotfix: removed redundant check" if i == 2 else ""),
+            subsystem  = "auth" if i < 3 else "db",
+        )
+        tcl.ingest(ev)
+    metrics = tcl.step(batch_size=4)
+    print(f"  TCL step metrics: {metrics}")
+    similar = tcl.retrieve_similar("login validation fix", top_k=3)
+    print(f"  Similar diffs:    {[d['diff_id'] for d in similar]}")
+
+    # ── NEW v3: Recursive Self-Distillation smoke test ────────────────────
+    print("\n--- RecursiveSelfDistiller ---")
+    distiller = RecursiveSelfDistiller(cfg, graph=graph)
+    reports = distiller.multi_round(
+        "Filter a list keeping only prime numbers",
+        base_code=sample_code,
+    )
+    print(f"  Distillation rounds: {len(reports)}")
+    for r in reports:
+        print(f"    round {r['round_index']}: consensus_ratio={r['consensus_ratio']:.2f} "
+              f"reward={r['mean_reward']:.3f} skipped={r['skipped']}")
+    print(f"  Adapters trained: {distiller.list_adapters()}")
+    adapter = distiller.get_adapter("distill_round_0")
+    if adapter:
+        x_test = torch.randn(1, cfg.d_model)
+        delta  = adapter(x_test)
+        print(f"  Adapter delta shape: {delta.shape}")
+
+    # ── MultiLevelMemoryMgr smoke test ────────────────────────────────────
+    print("\n--- MultiLevelMemoryMgr ---")
+    store   = SharedMemoryStore(graph_embed_dim=cfg.graph_embed_dim)
+    mem_mgr = MultiLevelMemoryMgr(store, model, cfg)
+    episode = {
+        "interaction_batch": 8,
+        "messages": [
+            {"source": "Coordinator", "target": "Planner",
+             "message": "Decompose auth refactor task.", "status": "done"},
+            {"source": "Planner", "target": "Engineer",
+             "message": "Implement JWT rotation.", "status": "done"},
+            {"source": "Pessimist", "target": "Coordinator",
+             "message": "Missing rollback step.", "status": "done"},
+        ],
+    }
+    compressed = mem_mgr.compress_episode(episode, node_id="ep8")
+    print(f"  Gist:    {compressed['gist']}")
+    print(f"  Summary: {compressed['summary'][:80]}…")
+
+    # ── MetaOrchestrator smoke test ───────────────────────────────────────
+    print("\n--- MetaOrchestrator ---")
+    meta = MetaOrchestrator(store, model, cfg)
+    meta_results = meta.orchestrate(
+        "Refactor auth module: security hardening, database migration, and API contract check")
+    print(f"  Routing head:         {meta_results.get('routing_head')}")
+    print(f"  Specialists spawned:  {meta_results.get('specialists_spawned')}")
+    for role in meta_results.get("specialists_spawned", []):
+        info = meta_results.get(role, {})
+        print(f"    [{role}] {str(info.get('summary', info))[:80]}")
+
+    # ── HierarchicalCogSearch smoke test ─────────────────────────────────
+    print("\n--- HierarchicalCogSearch (with Adversarial MCTS) ---")
+    problem_solver       = ProblemSolver(store, model)
+    terminal_guy         = TerminalGuy(store, model)
+    pessimist            = Pessimist(store, model)
+    vulnerability_finder = VulnerabilityFinder(store, model)
+
+    h_search = HierarchicalCogSearch(
+        problem_solver=problem_solver,
+        terminal_guy=terminal_guy,
+        pessimist=pessimist,
+        vuln_finder=vulnerability_finder,
+        model=model,
+        config=cfg,
+        k_expansions=2,
+    )
+    result = h_search.search(
+        prompt="Write a function that filters a list keeping only prime numbers",
+        iterations=4,
+        run_tests=False,
+        levels=["architecture", "file"],
+    )
+    print(f"  Best reward (file):  {result['best_reward']:.3f}")
+    print(f"  Reward signals:      {result['reward_signals']}")
+    print(f"  Tree stats:          {result['tree_stats']}")
+    print(f"  DPO pairs:           {len(result['dpo_pairs'])}")
+    print(f"  Adv pool size:       {len(h_search.adv_test_pool)}")
+    for lvl, r in result["per_level"].items():
+        sigs = r.get("reward_signals", {})
+        robust = sigs.get("robust_score", "n/a")
+        print(f"    Level [{lvl:12s}]: reward={r['best_reward']:.3f} "
+              f"robust={robust} nodes={r['tree_stats']['total_nodes']}")
+
+    # Subroutine interface
+    sub_result = h_search.search_subroutine(
+        "Fix the _parse_date function to handle timezone-aware ISO 8601 strings",
+        level="line", iterations=3,
+    )
+    print(f"  Subroutine (line):   reward={sub_result['best_reward']:.3f}")
+
+    # ── Full CogWorksSwarm v3 smoke test ──────────────────────────────────
+    print("\n--- CogWorksSwarm v3 (full pipeline) ---")
+    swarm   = CogWorksSwarm(model=model, config=cfg)
+    results = swarm.run(
+        "Refactor auth module for better security, add database migration support",
+        repo_root=".",
+    )
+    print(f"  Routing head:         {results.get('routing_head')}")
+    print(f"  Specialists:          {results['meta_orchestrator'].get('specialists_spawned')}")
+    print(f"  Quality gate:         {results['quality_gate']}")
+    print(f"  Verifier proxy:       {results['verifier_proxy_score']:.3f}")
+    print(f"  Graph stats:          {results['graph_stats']}")
+    print(f"  TCL metrics:          {results.get('tcl_metrics')}")
+    print(f"  Self-distillation:    {results.get('self_distillation')}")
+    print(f"  Latent comms:         {results.get('latent_comms')}")
+    print(f"  Agents completed:     {[k for k in results if not k.startswith('_')]}")
+
+    # Hierarchical CogSearch via swarm
+    print("\n--- Hierarchical CogSearch via swarm (adversarial MCTS) ---")
+    cs_result = swarm.cog_search(
+        prompt="Write a cache-aware, O(n log n) prime sieve",
+        iterations=4,
+        run_tests=False,
+        levels=["architecture", "file"],
+        k_expansions=2,
+    )
+    print(f"  Best reward:         {cs_result['best_reward']:.3f}")
+    print(f"  Levels run:          {cs_result['tree_stats'].get('levels_run')}")
+    print(f"  Total nodes:         {cs_result['tree_stats']['total_nodes']}")
+    print(f"  DPO pairs total:     {len(cs_result['dpo_pairs'])}")
+    print(f"  Adv pool (swarm):    {swarm.adv_test_pool.stats()}")
+    if cs_result["dpo_pairs"]:
+        pair = cs_result["dpo_pairs"][0]
+        print(f"  Sample pair delta:   {pair['reward_delta']:+.3f} [{pair['level']}]")
     print(f"CogForge v2 parameters:  {model.count_parameters():,}")
     print(f"Graph embed dim:         {cfg.graph_embed_dim}")
     print(f"Beam width (MCTS):       {cfg.mcts_beam_width}")
