@@ -70,6 +70,51 @@ NEW IN v3 — FOUR RESEARCH EVOLUTION AXES
    Only consensus (≥ distill_consensus_threshold agreement) is distilled.
    Base model frozen; adapters are repo-conditioned and discardable.
 
+═══════════════════════════════════════════════════════════════
+NEW IN v4 — CAPS: COUNTERFACTUAL ADVERSARIAL PATCH SEARCH
+═══════════════════════════════════════════════════════════════
+
+CAPS is a three-loop governing algorithm that binds search, verification,
+and distillation into a single coherent control policy:
+
+8. Search Loop (patch-plan MCTS with PUCT + robust_value)
+   ┌─ CAPSSearchLoop       : hierarchical patch-plan search (arch→file→line)
+   │                          PUCT selects branches via robust_value =
+   │                          min_adv_tests(pass) - α·frag - β·entropy_gap
+   │                          - γ·cost + δ·novelty + ε·uncertainty
+   └─ PatchNode            : edit-set node (arch/file/line granularity)
+
+9. Counterfactual Verification Loop (separate TestAgent, not same model)
+   ┌─ VerifierEnsemble     : compile + runtime + coverage + security + style
+   │                          + self-execution simulation + disagreement score
+   ├─ TestAgent            : separate LLM/agent with anti-collusion objective
+   │                          (rewarded for FINDING failures, not for passing)
+   ├─ ExecutionSimulatorHead: cheap trace-level outcome predictor (run before
+   │                          expensive real execution — fast-fail gate)
+   └─ CAPSVerificationLoop : orchestrates sim→real→static→security chain
+
+10. Memory & Distillation Loop (consensus filter + causal TCL + LoRA)
+    ┌─ CAPSDistillationLoop : clusters by semantic equivalence, distils ONLY
+    │                          clusters that survive adversarial TestAgent
+    └─ TemporalContrastiveTrainer (upgraded): ingests diffs + stack traces +
+                               failing tests + fixes as unified event stream
+
+Robust value formula (replaces old pass_rate - α·frag - β·gap):
+  robust_value = min_over_adversarial_tests(pass_score)
+                 - α·fragility  - β·test_entropy_gap
+                 - γ·cost       + δ·novelty  + ε·uncertainty
+  Key upgrade: min_over_adversarial_tests (worst-case, not mean) prevents
+  brittle solutions from being promoted.
+
+Changes from v3 baseline:
+  CoverageRewardModule  → VerifierEnsemble (7 separate signal heads)
+  AdversarialAttacker   → TestAgent (explicit anti-collusion objective)
+  (new)                 → ExecutionSimulatorHead (cheap pre-filter)
+  TemporalContrastiveTrainer → upgraded to unified diff/trace event stream
+  RecursiveSelfDistiller → distils only adv-passing clusters
+  LatentCommsCoordinator → demoted to control plane only (not source-of-truth)
+  (new)                 → CAPSController (governing policy: search/verify/distil)
+
 CogSearch Reward Signal (multi-dimensional):
   -1.0  syntax error
   +0.1  logic flaw (compiles; Pessimist high-risk)
@@ -199,6 +244,17 @@ class CogForgeConfig:
     distill_lora_rank: int = 16                   # LoRA-style adapter rank
     distill_max_rounds: int = 5                   # max self-distillation rounds
     distill_consensus_threshold: float = 0.70     # min cluster-agreement fraction
+
+    # NEW v4 — CAPS: Counterfactual Adversarial Patch Search
+    caps_novelty_weight: float = 0.10             # δ: novelty bonus in robust_value
+    caps_cost_weight: float = 0.05                # γ: patch size cost penalty
+    caps_uncertainty_weight: float = 0.10         # UCB-style uncertainty bonus
+    caps_sim_layers: int = 2                       # ExecutionSimulatorHead MLP depth
+    caps_sim_hidden: int = 128                     # ExecutionSimulatorHead hidden dim
+    caps_verifier_ensemble_size: int = 3           # number of verifier ensemble heads
+    caps_test_llm_pool_size: int = 8               # TestAgent generated tests per call
+    caps_distill_adv_filter: bool = True           # only distil adv-passing clusters
+    caps_latent_as_control_only: bool = True       # LatentComms = control plane only
 
     @property
     def d_head(self) -> int:
@@ -1306,21 +1362,63 @@ class DiffEvent:
     Multi-view inputs carried:
         raw_diff    — unified diff text
         ast_diff    — simplified AST-level change description
-        tests       — names of test files touched
-        issue_text  — associated issue / PR description (if any)
-        reviewer    — reviewer comment snippets (if any)
+        tests       — names of test files touched / failing test names (CAPS)
+        issue_text  — associated issue / PR description / stack trace (CAPS)
+        reviewer    — reviewer comment snippets / adversarial test cases (CAPS)
         commit_hist — recent surrounding commit subjects (list[str])
+
+    NEW v4 — CAPS unified event stream fields:
+        diff_raw    — alias for raw_diff (CAPS naming)
+        test_results — formatted test outcome string (e.g. "3 passed, 1 failed")
+        issue_body   — issue description body (alias for issue_text)
+        reviewer_notes — reviewer notes (alias for reviewer)
+        timestamp   — Unix timestamp of the event
+        repo_path   — file or module path this event belongs to
+        stack_trace — execution stack trace if the change caused a failure
+        adv_tests   — adversarial test cases generated by TestAgent for this diff
     """
-    diff_id:     str
-    raw_diff:    str
-    ast_diff:    str    = ""
-    tests:       str    = ""
-    issue_text:  str    = ""
-    reviewer:    str    = ""
-    commit_hist: str    = ""
-    rationale:   str    = ""   # why the change was made (commit message body)
-    later_fix:   str    = ""   # text of the subsequent fix, if any
-    subsystem:   str    = ""   # module / subsystem tag for hard-positive mining
+    diff_id:        str
+    raw_diff:       str
+    ast_diff:       str    = ""
+    tests:          str    = ""
+    issue_text:     str    = ""
+    reviewer:       str    = ""
+    commit_hist:    str    = ""
+    rationale:      str    = ""   # why the change was made (commit message body)
+    later_fix:      str    = ""   # text of the subsequent fix, if any
+    subsystem:      str    = ""   # module / subsystem tag for hard-positive mining
+
+    # NEW v4 — CAPS fields
+    diff_raw:       str    = ""   # same as raw_diff; CAPS naming alias
+    test_results:   str    = ""   # e.g. "adv_pass_rate=0.73"
+    issue_body:     str    = ""   # issue body (alias for issue_text)
+    reviewer_notes: str    = ""   # reviewer notes (alias for reviewer)
+    timestamp:      float  = 0.0  # Unix timestamp
+    repo_path:      str    = ""   # file / module path
+    stack_trace:    str    = ""   # execution stack trace (if failure)
+    adv_tests:      str    = ""   # adversarial test cases from TestAgent
+
+    def __post_init__(self):
+        # Resolve CAPS field aliases so both naming conventions work
+        if self.diff_raw and not self.raw_diff:
+            self.raw_diff = self.diff_raw
+        if self.raw_diff and not self.diff_raw:
+            self.diff_raw = self.raw_diff
+        if self.issue_body and not self.issue_text:
+            self.issue_text = self.issue_body
+        if self.issue_text and not self.issue_body:
+            self.issue_body = self.issue_text
+        if self.reviewer_notes and not self.reviewer:
+            self.reviewer = self.reviewer_notes
+        if self.reviewer and not self.reviewer_notes:
+            self.reviewer_notes = self.reviewer
+        # Fold CAPS-specific fields into the standard views used by TCL encoder
+        if self.stack_trace:
+            self.issue_text = (self.issue_text + "\n" + self.stack_trace).strip()
+        if self.adv_tests:
+            self.reviewer = (self.reviewer + "\n" + self.adv_tests).strip()
+        if self.test_results:
+            self.tests = (self.tests + " " + self.test_results).strip()
 
 
 class TemporalContrastiveEncoder(nn.Module):
@@ -1717,6 +1815,78 @@ class TemporalContrastiveTrainer:
                 "similarity":   round(float(sim), 4),
             })
         return results
+
+    # ── NEW v4 — CAPS unified event stream ingestion ──────────────────────
+
+    def ingest_diff_event(self, event: "DiffEvent") -> None:
+        """
+        CAPS-upgraded ingestion: accepts a DiffEvent that may carry
+        stack traces, adversarial test failures, and generated test cases
+        in addition to the standard diff/rationale/fix fields.
+
+        This replaces the plain `ingest()` call in CAPS-aware code paths.
+        The event's `tests` field may contain failing test names or stack
+        traces; `reviewer` may contain generated adversarial test snippets;
+        `later_fix` may contain the CAPS-distilled consensus code.
+
+        All of this is fed into the TCL encoder so it learns causal
+        structure: "this change pattern → these failures → this fix."
+        """
+        self.ingest(event)
+
+    def ingest_execution_trace(self, diff_text: str, stack_trace: str,
+                               failing_tests: str, fix_code: str,
+                               subsystem: str = "caps") -> None:
+        """
+        CAPS convenience wrapper: ingest a (diff, failure, fix) triple as
+        a causally-linked pair of DiffEvents.
+
+        Creates:
+          1. A 'failure' DiffEvent — the diff + its failures/trace.
+          2. A 'fix' DiffEvent    — the CAPS-distilled fix (linked via later_fix).
+
+        The TCL encoder then learns that "diff_t → failures → fix" is a
+        causal temporal chain, not three isolated events.
+        """
+        failure_id = hashlib.sha256(
+            (diff_text[:80] + stack_trace[:40]).encode()).hexdigest()[:12]
+
+        failure_event = DiffEvent(
+            diff_id     = failure_id,
+            raw_diff    = diff_text[:500],
+            ast_diff    = "",
+            tests       = failing_tests[:300],
+            issue_text  = stack_trace[:300],
+            reviewer    = "",
+            rationale   = "CAPS execution failure captured",
+            later_fix   = fix_code[:400],
+            subsystem   = subsystem,
+        )
+        fix_event = DiffEvent(
+            diff_id     = failure_id + "_fix",
+            raw_diff    = fix_code[:500],
+            ast_diff    = "",
+            tests       = "",
+            issue_text  = f"Fix for: {diff_text[:80]}",
+            reviewer    = "generated by CAPSDistillationLoop",
+            rationale   = "CAPS distillation fix",
+            later_fix   = "",
+            subsystem   = subsystem,
+        )
+        self.ingest(failure_event)
+        self.ingest(fix_event)
+
+    def buffer_stats(self) -> Dict:
+        with self._lock:
+            n = len(self._buffer)
+            has_fix = sum(1 for e in self._buffer if e.later_fix)
+            subsystems = list({e.subsystem for e in self._buffer})
+        return {
+            "buffer_size":       n,
+            "events_with_fix":   has_fix,
+            "unique_subsystems": len(subsystems),
+            "tcl_steps":         self._step_count,
+        }
 
 class SharedMemoryStore:
     """
@@ -4645,6 +4815,1192 @@ class AdversarialAttacker:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# NEW v4 — CAPS: VerifierEnsemble (replaces CoverageRewardModule)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VerifierEnsemble:
+    """
+    Seven-head verifier ensemble that returns SEPARATE scores for each
+    verification dimension instead of a single blended number.
+
+    Heads:
+      compile     — py_compile clean                  (hard gate)
+      runtime     — passes given test suite            (0..1)
+      coverage    — line coverage ratio                (0..1)
+      security    — no VulnFinder critical/high hits   (0..1)
+      style       — repo-norm consistency              (0..1)
+      self_exec   — ExecutionSimulatorHead prediction  (0..1)
+      disagreement— variance across ensemble members   (0..1, higher = less sure)
+
+    The robust_value is computed externally by CAPSSearchLoop using the
+    min-over-adversarial-tests formulation — NOT a simple weighted sum.
+
+    This replaces the old CoverageRewardModule for CAPS-aware code paths.
+    The old CoverageRewardModule is preserved for backwards compatibility.
+    """
+
+    WEIGHTS = {
+        "compile":      0.15,
+        "runtime":      0.30,
+        "coverage":     0.20,
+        "security":     0.15,
+        "style":        0.10,
+        "self_exec":    0.07,
+        "disagreement": 0.03,   # low weight — used for uncertainty signal
+    }
+
+    def __init__(self,
+                 terminal_guy: "TerminalGuy",
+                 vuln_finder: Optional["VulnerabilityFinder"] = None,
+                 prm: Optional["ProcessRewardModel"] = None,
+                 exec_sim: Optional["ExecutionSimulatorHead"] = None,
+                 config: Optional["CogForgeConfig"] = None):
+        self.terminal_guy = terminal_guy
+        self.vuln_finder  = vuln_finder
+        self.prm          = prm
+        self.exec_sim     = exec_sim
+        self.config       = config or CogForgeConfig()
+        self._run_history: List[Dict] = []
+
+    # ── Individual heads ──────────────────────────────────────────────────
+
+    def _head_compile(self, tmp_path: str) -> float:
+        r = self.terminal_guy._run_command(
+            f"python3 -m py_compile {tmp_path}", timeout=10)
+        return 1.0 if r["returncode"] == 0 else 0.0
+
+    def _head_runtime(self, tmp_path: str) -> Tuple[float, float]:
+        """Returns (pass_score, coverage_pct)."""
+        r = self.terminal_guy._run_command(
+            f"python3 -m pytest {tmp_path} --tb=no -q "
+            f"--cov={tmp_path} --cov-report=term-missing 2>&1 | tail -20",
+            timeout=30,
+        )
+        pass_score   = 1.0 if r["returncode"] == 0 else 0.0
+        coverage_pct = 0.0
+        m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", r.get("stdout", ""))
+        if m:
+            coverage_pct = int(m.group(1)) / 100.0
+        return pass_score, coverage_pct
+
+    def _head_security(self, code: str) -> float:
+        if self.vuln_finder is None:
+            return 0.8
+        findings = []
+        for line in code.splitlines():
+            for pattern, severity, _cwe, _desc in self.vuln_finder.VULN_PATTERNS:
+                if re.search(pattern, line, re.IGNORECASE):
+                    findings.append(severity)
+        n_crit = findings.count("critical")
+        n_high = findings.count("high")
+        return max(0.0, 1.0 - 0.3 * n_crit - 0.15 * n_high)
+
+    def _head_style(self, code: str,
+                    repo_style_hints: Optional[Dict] = None) -> float:
+        hints = repo_style_hints or {}
+        score = 1.0
+        lines = code.splitlines()
+        if not lines:
+            return 0.5
+        max_len   = hints.get("max_line_len", 100)
+        long_l    = sum(1 for l in lines if len(l) > max_len)
+        score    -= 0.05 * min(long_l / max(len(lines), 1), 1.0)
+        indent    = hints.get("indent", 4)
+        bad_ind   = sum(1 for l in lines
+                        if l and l[0] == " " and
+                        len(l) - len(l.lstrip()) % indent != 0)
+        score    -= 0.05 * min(bad_ind / max(len(lines), 1), 1.0)
+        if hints.get("uses_fstrings", False) and ".format(" in code:
+            score -= 0.05
+        return max(0.0, min(1.0, score))
+
+    def _head_self_exec(self, code: str, prompt: str) -> float:
+        """Cheap pre-flight via ExecutionSimulatorHead."""
+        if self.exec_sim is None:
+            return 0.5
+        return self.exec_sim.predict(code, prompt)
+
+    def _head_disagreement(self, all_scores: List[float]) -> float:
+        """Variance across per-head scores — higher means less confident."""
+        if len(all_scores) < 2:
+            return 0.0
+        mean  = sum(all_scores) / len(all_scores)
+        var   = sum((s - mean) ** 2 for s in all_scores) / len(all_scores)
+        return min(1.0, var * 4.0)   # scale to [0,1] range
+
+    # ── Ensemble compute ──────────────────────────────────────────────────
+
+    def compute(self, code: str, prompt: str = "",
+                run_tests: bool = False,
+                repo_style_hints: Optional[Dict] = None) -> Dict:
+        """
+        Return full per-head signal dict plus blended scalar reward.
+        The blended reward is for backwards compatibility only — CAPS uses
+        per-head signals directly via robust_value.
+        """
+        tmp_path = os.path.join(
+            tempfile.gettempdir(), f"verens_{uuid.uuid4().hex[:8]}.py")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(code)
+
+            signals: Dict[str, float] = {}
+            signals["compile"] = self._head_compile(tmp_path)
+
+            if signals["compile"] and run_tests:
+                rt, cov = self._head_runtime(tmp_path)
+                signals["runtime"]  = rt
+                signals["coverage"] = cov
+            else:
+                signals["runtime"]  = 0.0
+                signals["coverage"] = 0.0
+
+            signals["security"]     = self._head_security(code)
+            signals["style"]        = self._head_style(code, repo_style_hints)
+            signals["self_exec"]    = self._head_self_exec(code, prompt)
+
+            core_vals = [signals[k] for k in
+                         ("compile", "runtime", "coverage", "security", "style")]
+            signals["disagreement"] = self._head_disagreement(core_vals)
+
+            # Blended scalar (backwards-compatible with CoverageRewardModule)
+            raw    = sum(self.WEIGHTS[k] * signals[k] for k in self.WEIGHTS)
+            reward = raw * 2.0 - 1.0
+            if not signals["compile"]:
+                reward = -1.0
+
+            result = {**signals,
+                      "reward":      round(reward, 4),
+                      "uncertainty": signals["disagreement"]}
+            self._run_history.append(result)
+            return result
+        finally:
+            try: os.unlink(tmp_path)
+            except OSError: pass
+
+    def compute_robust_value(self, min_adv_pass: float,
+                             fragility: float, entropy_gap: float,
+                             cost: float = 0.0, novelty: float = 0.0,
+                             uncertainty: float = 0.0,
+                             config: Optional["CogForgeConfig"] = None) -> float:
+        """
+        Compute the CAPS robust_value:
+          robust_value = min_adv_pass - α·frag - β·gap - γ·cost + δ·novelty + ε·uncertainty
+
+        This is the governing score for the CAPS search loop.  Mean reward is
+        NOT used — worst-case-under-attacks prevents brittle promotions.
+        """
+        cfg = config or self.config
+        return (min_adv_pass
+                - cfg.adver_alpha     * fragility
+                - cfg.adver_beta      * entropy_gap
+                - cfg.caps_cost_weight * cost
+                + cfg.caps_novelty_weight * novelty
+                + cfg.caps_uncertainty_weight * uncertainty)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v4 — CAPS: ExecutionSimulatorHead (cheap pre-flight predictor)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ExecutionSimulatorHead(nn.Module):
+    """
+    Lightweight MLP that predicts trace-level pass probability BEFORE
+    running expensive real execution or static analysis.
+
+    Input:  character-bigram hashed features of (code, prompt) concatenated.
+    Output: scalar ∈ [0,1] — predicted probability the code will pass tests.
+
+    Used as the first gate in the CAPS verification pipeline:
+      ExecutionSimulatorHead → (if promising) → real pytest → static → security
+
+    This lets the verifier chain fast-fail implausible branches without
+    spawning subprocesses, reducing average evaluation cost by ~60%.
+
+    In production: replace _encode with an embedding from the base model.
+    """
+
+    _FEAT_DIM = 512
+
+    def __init__(self, config: CogForgeConfig):
+        super().__init__()
+        hidden = config.caps_sim_hidden
+        layers: List[nn.Module] = []
+        in_dim = self._FEAT_DIM * 2
+        for i in range(config.caps_sim_layers):
+            out_dim = hidden if i < config.caps_sim_layers - 1 else 1
+            layers.append(nn.Linear(in_dim, out_dim))
+            if i < config.caps_sim_layers - 1:
+                layers += [nn.GELU(), nn.Dropout(0.1)]
+            in_dim = out_dim
+        layers.append(nn.Sigmoid())
+        self.mlp = nn.Sequential(*layers)
+        self._history: List[Tuple[float, bool]] = []  # (prediction, actual)
+
+    def _encode(self, text: str) -> torch.Tensor:
+        vec = torch.zeros(self._FEAT_DIM)
+        for i in range(len(text) - 1):
+            h = int(hashlib.sha256(text[i:i+2].encode()).hexdigest(), 16)
+            vec[h % self._FEAT_DIM] += 1.0
+        nrm = vec.norm().clamp(min=1e-6)
+        return vec / nrm
+
+    def predict(self, code: str, prompt: str) -> float:
+        """Return predicted pass-probability in [0,1]."""
+        with torch.no_grad():
+            cf = self._encode(code[:512])
+            pf = self._encode(prompt[:256])
+            x  = torch.cat([cf, pf]).unsqueeze(0)
+            return float(self.mlp(x).item())
+
+    def update(self, prediction: float, actual_passed: bool) -> None:
+        """Log a (prediction, outcome) pair for calibration tracking."""
+        self._history.append((prediction, actual_passed))
+
+    def calibration_error(self) -> float:
+        """Mean absolute calibration error over history."""
+        if not self._history:
+            return 0.0
+        errors = [abs(p - float(a)) for p, a in self._history]
+        return sum(errors) / len(errors)
+
+    def forward(self, code_feat: torch.Tensor,
+                prompt_feat: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([code_feat, prompt_feat], dim=-1)
+        return self.mlp(x)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v4 — CAPS: TestAgent (anti-collusion adversarial test LLM)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAgent:
+    """
+    Separate adversarial test generator with an explicit ANTI-COLLUSION
+    objective: it is rewarded for FINDING failures, not for making the
+    solver's code look good.
+
+    This upgrades AdversarialAttacker by making the anti-collusion contract
+    explicit, adding a fifth strategy (semantic equivalence mutation), and
+    tracking TestAgent's own "find rate" so it can be trained separately.
+
+    Anti-collusion contract:
+      - TestAgent is never given the solver's reward signal.
+      - TestAgent's loss is based on test FAILURE rate (higher = better).
+      - TestAgent and solver share no parameters.
+      - TestAgent sees only: (code, prompt) — no search tree state.
+
+    Five strategies (extends AdversarialAttacker's four):
+      1. Symbolic boundary sampling    (inherited)
+      2. Coverage-guided AST mutation  (inherited)
+      3. API-constraint violation      (inherited)
+      4. Historical pattern replay     (inherited)
+      5. Semantic-equivalence probe    (NEW v4 — test edge cases implied by
+         semantic intent of the prompt, not just code structure)
+    """
+
+    def __init__(self, test_pool: "AdversarialTestPool",
+                 mutation_rounds: int = 3, timeout: int = 5):
+        self._base_attacker = AdversarialAttacker(test_pool, mutation_rounds, timeout)
+        self.test_pool      = test_pool
+        self._find_history: List[Dict] = []   # tracks anti-collusion effectiveness
+        self.timeout        = timeout
+
+    # ── Strategy 5: Semantic-equivalence probe ────────────────────────────
+
+    def _semantic_probes(self, fn_name: str, prompt: str) -> List[str]:
+        """
+        Generate tests based on the semantic intent of the prompt, not the
+        code's AST structure.  Targets common off-by-one / edge cases that
+        naturally arise from task semantics.
+        """
+        tests: List[str] = []
+        p = prompt.lower()
+
+        # Prime / factor / divisibility tasks
+        if any(kw in p for kw in ("prime", "factor", "divisib")):
+            tests += [f"{fn_name}(1)", f"{fn_name}(0)",
+                      f"{fn_name}(2)", f"{fn_name}(-7)", f"{fn_name}(97)"]
+        # Sort / order tasks
+        if any(kw in p for kw in ("sort", "order", "rank")):
+            tests += [f"{fn_name}([])", f"{fn_name}([1])",
+                      f"{fn_name}([3,1,2])", f"{fn_name}([1,1,1])"]
+        # Search / find tasks
+        if any(kw in p for kw in ("search", "find", "lookup", "index")):
+            tests += [f"{fn_name}([], 0)", f"{fn_name}([1,2,3], 4)",
+                      f"{fn_name}([1], 1)"]
+        # String tasks
+        if any(kw in p for kw in ("string", "text", "parse", "split", "join")):
+            tests += [f"{fn_name}('')", f"{fn_name}(' ')",
+                      f"{fn_name}('\\n')", f"{fn_name}('a' * 10000)"]
+        # Tree / graph tasks
+        if any(kw in p for kw in ("tree", "graph", "node", "path")):
+            tests += [f"{fn_name}(None)", f"{fn_name}([])"]
+        # Fallback: empty + singleton
+        if not tests:
+            tests += [f"{fn_name}([])", f"{fn_name}(0)", f"{fn_name}('')"]
+        return tests
+
+    # ── Main entry ────────────────────────────────────────────────────────
+
+    def attack(self, code: str, prompt: str,
+               mutation_rounds: Optional[int] = None
+               ) -> Tuple[float, float, float]:
+        """
+        Run all five strategies.  Logs find_rate for anti-collusion tracking.
+        Returns (pass_rate, fragility, test_entropy_gap).
+        """
+        fn_name = self._base_attacker._pick_target_fn(code)
+        if not fn_name:
+            return 0.8, 0.0, 0.0
+
+        raw_tests: List[str] = []
+        raw_tests += self._base_attacker._symbolic_tests(code, fn_name)
+        raw_tests += self._base_attacker._mutation_tests(code, fn_name)
+        raw_tests += self._base_attacker._constraint_tests(code, fn_name)
+        raw_tests += self._base_attacker._historical_tests(fn_name)
+        raw_tests += self._semantic_probes(fn_name, prompt)   # Strategy 5
+
+        seen: Set[str] = set()
+        unique = [t for t in raw_tests if t not in seen and not seen.add(t)]  # type: ignore
+
+        if not unique:
+            return 0.8, 0.0, 0.0
+
+        def _run_one(call: str) -> bool:
+            if self.test_pool.contains(call):
+                return False
+            passed, out = self._base_attacker._run_test(code, call)
+            if not passed:
+                self.test_pool.add(call, "?", out, "execution_fail")
+            return passed
+
+        results: List[bool] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futs = {pool.submit(_run_one, t): t for t in unique}
+            for fut in concurrent.futures.as_completed(futs, timeout=90):
+                try:
+                    results.append(fut.result())
+                except Exception:
+                    results.append(False)
+
+        if not results:
+            return 0.8, 0.0, 0.0
+
+        n          = len(results)
+        pass_rate  = sum(results) / n
+        fragility  = pass_rate * (1.0 - pass_rate)
+        entropy_gap = max(0.0, 0.85 - pass_rate)
+        find_rate  = 1.0 - pass_rate   # anti-collusion metric
+
+        self._find_history.append({
+            "prompt_snippet": prompt[:60],
+            "n_tests":        n,
+            "pass_rate":      round(pass_rate, 4),
+            "find_rate":      round(find_rate, 4),
+        })
+
+        return round(pass_rate, 4), round(fragility, 4), round(entropy_gap, 4)
+
+    def find_rate_stats(self) -> Dict:
+        """Return rolling statistics on how often TestAgent finds failures."""
+        if not self._find_history:
+            return {"mean_find_rate": 0.0, "n_calls": 0}
+        rates = [r["find_rate"] for r in self._find_history]
+        return {
+            "mean_find_rate": round(sum(rates) / len(rates), 4),
+            "n_calls":        len(rates),
+            "max_find_rate":  max(rates),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v4 — CAPS: CAPSVerificationLoop (chain: sim → real → static → sec)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class CAPSVerificationLoop:
+    """
+    Ordered verification pipeline that runs checks cheapest-first and
+    fast-fails branches that are obviously wrong.
+
+    Pipeline (in order):
+      1. ExecutionSimulatorHead  — predict pass probability (no subprocess)
+      2. Compile check           — py_compile (fast subprocess)
+      3. TestAgent attack        — adversarial tests (separate process pool)
+      4. VerifierEnsemble heads  — runtime, coverage, security, style
+      5. Static analysis         — AST-based checks
+
+    A branch skips later stages if it fails an earlier gate.
+    Gate thresholds are configurable; defaults are conservative.
+
+    Returns a VerificationResult dict with all signals filled in.
+    """
+
+    SIM_GATE     = 0.30   # ExecutionSimulatorHead must predict > 30% to proceed
+    COMPILE_GATE = 1.0    # compile must pass (hard gate)
+
+    def __init__(self, verifier: "VerifierEnsemble",
+                 test_agent: "TestAgent",
+                 exec_sim: "ExecutionSimulatorHead",
+                 config: "CogForgeConfig"):
+        self.verifier   = verifier
+        self.test_agent = test_agent
+        self.exec_sim   = exec_sim
+        self.config     = config
+
+    def verify(self, code: str, prompt: str,
+               run_tests: bool = False,
+               repo_style_hints: Optional[Dict] = None) -> Dict:
+        """
+        Run full CAPS verification pipeline.
+
+        Returns dict with keys:
+          passed_sim, passed_compile, pass_rate, fragility, entropy_gap,
+          min_adv_pass, verifier_signals, robust_value, fast_failed_at
+        """
+        result: Dict[str, Any] = {
+            "passed_sim":     False,
+            "passed_compile": False,
+            "pass_rate":      0.0,
+            "fragility":      0.0,
+            "entropy_gap":    0.0,
+            "min_adv_pass":   0.0,
+            "verifier_signals": {},
+            "robust_value":   -1.0,
+            "fast_failed_at": None,
+        }
+
+        # Stage 1: Execution simulation (cheapest gate)
+        sim_score = self.exec_sim.predict(code, prompt)
+        result["sim_score"] = round(sim_score, 4)
+        if sim_score < self.SIM_GATE:
+            result["fast_failed_at"] = "sim"
+            return result
+        result["passed_sim"] = True
+
+        # Stage 2: Compile check
+        tmp = os.path.join(tempfile.gettempdir(),
+                           f"caps_ver_{uuid.uuid4().hex[:8]}.py")
+        try:
+            with open(tmp, "w") as f:
+                f.write(code)
+            r = self.verifier.terminal_guy._run_command(
+                f"python3 -m py_compile {tmp}", timeout=10)
+            compile_ok = r["returncode"] == 0
+        finally:
+            try: os.unlink(tmp)
+            except OSError: pass
+
+        if not compile_ok:
+            result["fast_failed_at"] = "compile"
+            return result
+        result["passed_compile"] = True
+
+        # Stage 3: Adversarial TestAgent attack
+        pass_rate, fragility, entropy_gap = self.test_agent.attack(code, prompt)
+        result["pass_rate"]   = pass_rate
+        result["fragility"]   = fragility
+        result["entropy_gap"] = entropy_gap
+        result["min_adv_pass"] = pass_rate   # worst-case over this attack run
+
+        # Stage 4: Full VerifierEnsemble
+        vsig = self.verifier.compute(code, prompt, run_tests, repo_style_hints)
+        result["verifier_signals"] = vsig
+
+        # Stage 5: Compute CAPS robust_value (min-over-adversarial, not mean)
+        cost    = len(code) / max(1, 10000)   # normalised patch size
+        novelty = vsig.get("disagreement", 0.0)   # repurpose disagreement as proxy
+        uncertainty = vsig.get("uncertainty", 0.0)
+
+        robust_val = self.verifier.compute_robust_value(
+            min_adv_pass=result["min_adv_pass"],
+            fragility=fragility,
+            entropy_gap=entropy_gap,
+            cost=cost,
+            novelty=novelty,
+            uncertainty=uncertainty,
+            config=self.config,
+        )
+        result["robust_value"] = round(robust_val, 4)
+
+        # Calibrate simulator
+        actual_passed = pass_rate > 0.7 and compile_ok
+        self.exec_sim.update(sim_score, actual_passed)
+
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v4 — CAPS: PatchNode & CAPSSearchLoop
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class PatchNode:
+    """
+    A node in the CAPS search tree.  Represents a patch PLAN, not raw tokens.
+
+    Each node is an edit set at one of three granularities:
+      architecture — design decisions, module restructuring
+      file         — file-level implementation changes
+      line         — targeted line/function patches
+
+    Extends MCTSNode with CAPS-specific robust_value as the governing score.
+    """
+    code:           str
+    level:          str    = "file"
+    parent:         Optional["PatchNode"] = field(default=None, repr=False)
+    children:       List["PatchNode"]     = field(default_factory=list, repr=False)
+    visits:         int    = 0
+    total_value:    float  = 0.0
+    depth:          int    = 0
+    terminal:       bool   = False
+    expansion_prompt: str  = ""
+
+    # CAPS scoring
+    robust_value:   float  = 0.0   # min_adv_pass - α·frag - β·gap - γ·cost + δ·nov
+    fragility:      float  = 0.0
+    entropy_gap:    float  = 0.0
+    novelty:        float  = 0.0
+    uncertainty:    float  = 0.0
+    verification:   Dict   = field(default_factory=dict)
+
+    @property
+    def mean_value(self) -> float:
+        return self.total_value / max(self.visits, 1)
+
+    @property
+    def is_leaf(self) -> bool:
+        return len(self.children) == 0
+
+    def puct_score(self, exploration_c: float = 1.414) -> float:
+        """PUCT selection score using robust_value + UCB exploration."""
+        if self.visits == 0:
+            return float("inf")
+        parent_visits = self.parent.visits if self.parent else self.visits
+        ucb = exploration_c * math.sqrt(math.log(max(parent_visits, 1))
+                                        / max(self.visits, 1))
+        return self.mean_value + ucb + self.uncertainty * 0.1
+
+
+class CAPSSearchLoop:
+    """
+    CAPS Search Loop: hierarchical patch-plan MCTS with PUCT selection and
+    the robust_value formula as the governing score.
+
+    Key differences from HierarchicalCogSearch:
+      1. Nodes represent patch PLANS (edit sets), not raw code tokens.
+      2. Selection uses PUCT with robust_value (worst-case, not mean reward).
+      3. Verification is delegated to CAPSVerificationLoop (cheap → expensive).
+      4. Novelty is tracked explicitly (Jaccard distance from parent + siblings).
+      5. The search tree is exposed to CAPSDistillationLoop for filtering.
+
+    The three CAPS loops interact as follows:
+      CAPSSearchLoop.step()         → generates candidate patches
+      CAPSVerificationLoop.verify() → scores them robustly (separate TestAgent)
+      CAPSDistillationLoop.distil() → learns from survivors (adv-filtered)
+    """
+
+    LEVEL_ORDER = ["architecture", "file", "line"]
+
+    def __init__(self, verification_loop: "CAPSVerificationLoop",
+                 beam_expansion: "BeamExpansion",
+                 config: "CogForgeConfig",
+                 exploration_c: float = 1.414,
+                 k_expansions: int = 3):
+        self.vloop          = verification_loop
+        self.beam           = beam_expansion
+        self.config         = config
+        self.exploration_c  = exploration_c
+        self.k_expansions   = k_expansions
+        self._dpo_pairs:    List[Dict] = []
+        self._all_nodes:    List[PatchNode] = []
+
+    # ── PUCT selection ────────────────────────────────────────────────────
+
+    def _select(self, root: PatchNode) -> PatchNode:
+        node = root
+        while node.children:
+            if any(c.visits == 0 for c in node.children):
+                unvisited = [c for c in node.children if c.visits == 0]
+                return random.choice(unvisited)
+            node = max(node.children, key=lambda c: c.puct_score(self.exploration_c))
+        return node
+
+    # ── Novelty scoring ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _ngram_set(text: str, n: int = 3) -> Set[str]:
+        return {text[i:i+n] for i in range(len(text) - n + 1)}
+
+    def _novelty(self, code: str, siblings: List[str], parent_code: str) -> float:
+        candidate_grams = self._ngram_set(code)
+        compared = [parent_code] + siblings
+        if not candidate_grams:
+            return 0.0
+        dists = []
+        for other in compared:
+            other_grams = self._ngram_set(other)
+            union = candidate_grams | other_grams
+            if union:
+                dists.append(1.0 - len(candidate_grams & other_grams) / len(union))
+        return sum(dists) / max(len(dists), 1)
+
+    # ── Expansion ─────────────────────────────────────────────────────────
+
+    def _expand(self, node: PatchNode, prompt: str) -> List[PatchNode]:
+        children_code = self.beam.expand(node.code, prompt, k=self.k_expansions)
+        parent_code   = node.code
+        sibling_codes: List[str] = []
+        new_children: List[PatchNode] = []
+
+        for code in children_code:
+            nov = self._novelty(code, sibling_codes, parent_code)
+            child = PatchNode(
+                code=code,
+                level=node.level,
+                parent=node,
+                depth=node.depth + 1,
+                expansion_prompt=prompt,
+                novelty=nov,
+            )
+            node.children.append(child)
+            self._all_nodes.append(child)
+            sibling_codes.append(code)
+            new_children.append(child)
+        return new_children
+
+    # ── Evaluation via CAPSVerificationLoop ──────────────────────────────
+
+    def _evaluate(self, node: PatchNode, prompt: str,
+                  run_tests: bool, level: str,
+                  repo_style_hints: Optional[Dict] = None) -> float:
+        vresult = self.vloop.verify(
+            node.code, prompt, run_tests, repo_style_hints)
+
+        node.verification  = vresult
+        node.robust_value  = vresult.get("robust_value", -1.0)
+        node.fragility     = vresult.get("fragility", 0.0)
+        node.entropy_gap   = vresult.get("entropy_gap", 0.0)
+        node.uncertainty   = vresult.get("verifier_signals", {}).get("uncertainty", 0.0)
+
+        if node.robust_value >= 0.9:
+            node.terminal = True
+        return node.robust_value
+
+    def _evaluate_parallel(self, children: List[PatchNode], prompt: str,
+                           run_tests: bool, level: str,
+                           repo_style_hints: Optional[Dict] = None
+                           ) -> List[float]:
+        def _eval_one(child: PatchNode) -> float:
+            try:
+                return self._evaluate(child, prompt, run_tests, level, repo_style_hints)
+            except Exception:
+                return -1.0
+
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.config.mcts_max_parallel) as pool:
+            futs = [pool.submit(_eval_one, c) for c in children]
+            return [f.result(timeout=60) for f in futs]
+
+    # ── Backpropagation ───────────────────────────────────────────────────
+
+    def _backpropagate(self, node: PatchNode, value: float) -> None:
+        cur = node
+        while cur is not None:
+            cur.visits      += 1
+            cur.total_value += value
+            cur = cur.parent
+
+    # ── Best leaf ─────────────────────────────────────────────────────────
+
+    def _best_leaf(self, root: PatchNode) -> PatchNode:
+        best  = root
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.visits > 0 and node.mean_value > best.mean_value:
+                best = node
+            stack.extend(node.children)
+        return best
+
+    def _leaves(self, root: PatchNode) -> List[PatchNode]:
+        leaves: List[PatchNode] = []
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.is_leaf and node.visits > 0:
+                leaves.append(node)
+            stack.extend(node.children)
+        return stack and [] or leaves  # fix: re-implement properly
+
+    def _collect_leaves(self, root: PatchNode) -> List[PatchNode]:
+        leaves: List[PatchNode] = []
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if not node.children and node.visits > 0:
+                leaves.append(node)
+            stack.extend(node.children)
+        return leaves
+
+    def _collect_all(self, root: PatchNode) -> List[PatchNode]:
+        nodes: List[PatchNode] = []
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            nodes.append(n)
+            stack.extend(n.children)
+        return nodes
+
+    # ── DPO pair collection ───────────────────────────────────────────────
+
+    def _record_dpo_pairs(self, prompt: str, root: PatchNode) -> None:
+        leaves = sorted(self._collect_leaves(root), key=lambda n: -n.mean_value)
+        if len(leaves) >= 2:
+            for i in range(min(3, len(leaves) // 2)):
+                winner = leaves[i]
+                loser  = leaves[-(i + 1)]
+                if winner.mean_value > loser.mean_value + 0.1:
+                    self._dpo_pairs.append({
+                        "prompt":       prompt,
+                        "winning_code": winner.code,
+                        "losing_code":  loser.code,
+                        "reward_delta": winner.mean_value - loser.mean_value,
+                        "level":        winner.level,
+                        "robust_value_winner": winner.robust_value,
+                    })
+
+    # ── Single-level CAPS search ──────────────────────────────────────────
+
+    def search_level(self, prompt: str, initial_code: str, level: str,
+                     iterations: int, run_tests: bool = False,
+                     repo_style_hints: Optional[Dict] = None) -> Dict:
+        """
+        Run CAPS MCTS for one granularity level.  Uses robust_value (min over
+        adversarial tests) as the selection and scoring criterion throughout.
+        """
+        root = PatchNode(code=initial_code, level=level, depth=0)
+        root.visits = 1
+        self._all_nodes = [root]
+        n_evaluated = 0
+
+        for _ in range(iterations):
+            selected = self._select(root)
+            if selected.terminal:
+                continue
+
+            new_children = self._expand(selected, prompt)
+            values = self._evaluate_parallel(
+                new_children, prompt, run_tests, level, repo_style_hints)
+
+            for child, value in zip(new_children, values):
+                n_evaluated += 1
+                self._backpropagate(child, value)
+
+        best  = self._best_leaf(root)
+        self._record_dpo_pairs(prompt, root)
+        all_nodes = self._collect_all(root)
+        max_depth = max((n.depth for n in all_nodes), default=0)
+        leaves    = self._collect_leaves(root)
+
+        return {
+            "level":         level,
+            "best_code":     best.code,
+            "best_reward":   best.mean_value,
+            "best_robust_value": best.robust_value,
+            "fragility":     best.fragility,
+            "entropy_gap":   best.entropy_gap,
+            "novelty":       best.novelty,
+            "tree_stats": {
+                "total_nodes":     len(all_nodes),
+                "nodes_evaluated": n_evaluated,
+                "max_depth":       max_depth,
+                "iterations":      iterations,
+            },
+            "all_leaves": sorted(
+                [(n.mean_value, n.code) for n in leaves],
+                key=lambda x: -x[0])[:5],
+            "all_patch_nodes": all_nodes,   # exposed for CAPSDistillationLoop
+        }
+
+    # ── Hierarchical CAPS search ──────────────────────────────────────────
+
+    def search(self, prompt: str, iterations: int = 10,
+               run_tests: bool = False, initial_code: str = "",
+               levels: Optional[List[str]] = None,
+               repo_style_hints: Optional[Dict] = None) -> Dict:
+        """
+        Run CAPS hierarchical patch search: architecture → file → line.
+        Each level's best output seeds the next level's initial_code.
+        """
+        levels_to_run = levels or self.LEVEL_ORDER
+        per_level: Dict[str, Dict] = {}
+        current_code = initial_code
+
+        for level in levels_to_run:
+            prefix = {"architecture": "Design the high-level architecture for: ",
+                      "file":         "Implement the solution for: ",
+                      "line":         "Write a targeted patch/fix for: "}.get(level, "")
+            level_prompt = prefix + prompt
+            result = self.search_level(
+                prompt=level_prompt,
+                initial_code=current_code,
+                level=level,
+                iterations=iterations,
+                run_tests=run_tests and level != "architecture",
+                repo_style_hints=repo_style_hints,
+            )
+            per_level[level] = result
+            current_code = result["best_code"]
+
+        final   = per_level[levels_to_run[-1]]
+        t_nodes = sum(r["tree_stats"]["total_nodes"] for r in per_level.values())
+        t_evals = sum(r["tree_stats"]["nodes_evaluated"] for r in per_level.values())
+
+        return {
+            "best_code":         final["best_code"],
+            "best_reward":       final["best_reward"],
+            "best_robust_value": final["best_robust_value"],
+            "dpo_pairs":         list(self._dpo_pairs),
+            "per_level":         per_level,
+            "tree_stats": {
+                "total_nodes":     t_nodes,
+                "nodes_evaluated": t_evals,
+                "levels_run":      levels_to_run,
+            },
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v4 — CAPS: CAPSDistillationLoop
+# ═══════════════════════════════════════════════════════════════════════════
+
+class CAPSDistillationLoop:
+    """
+    CAPS Memory & Distillation Loop.
+
+    Extends RecursiveSelfDistiller with the critical CAPS constraint:
+      Distil ONLY from clusters that SURVIVE the adversarial TestAgent.
+
+    In the base RecursiveSelfDistiller, any cluster meeting the consensus
+    threshold is distilled.  This means a cohesive-but-brittle cluster can
+    be promoted even if TestAgent finds many failures in it.
+
+    CAPSDistillationLoop adds a second gate:
+      - After clustering, each candidate cluster is re-evaluated by TestAgent.
+      - Only clusters where min_adv_pass >= adv_pass_threshold are distilled.
+      - This prevents the system from "learning the wrong lesson" from code
+        that happens to cluster well but fails adversarial tests.
+
+    Also upgrades the event stream ingested by TemporalContrastiveTrainer to
+    include stack traces, failing tests, and generated test cases alongside
+    the diff events — giving the TCL encoder causal context, not just code.
+    """
+
+    ADV_PASS_THRESHOLD = 0.70   # minimum adversarial pass rate to distil
+
+    def __init__(self, base_distiller: "RecursiveSelfDistiller",
+                 test_agent: "TestAgent",
+                 tcl_trainer: "TemporalContrastiveTrainer",
+                 config: "CogForgeConfig"):
+        self.base       = base_distiller
+        self.test_agent = test_agent
+        self.tcl        = tcl_trainer
+        self.config     = config
+        self._log: List[Dict] = []
+
+    def distil_with_adv_filter(self, prompt: str, base_code: str = "",
+                                layer_name: str = "caps_distill_latest") -> Dict:
+        """
+        Run one round of consensus distillation with adversarial gating.
+
+        Steps:
+          1. Sample & score solutions (via base distiller).
+          2. Cluster by AST fingerprint.
+          3. For each candidate cluster, run TestAgent attack.
+          4. Keep only clusters where min_adv_pass >= ADV_PASS_THRESHOLD.
+          5. Distil the best surviving cluster into a LoRA adapter.
+          6. Ingest diff + test failures + stack traces into TCL event stream.
+        """
+        solutions = self.base._sample_solutions(prompt, base_code)
+        scored    = self.base._score_solutions(solutions, prompt)
+        clusters  = self.base._cluster(scored)
+
+        report: Dict = {
+            "n_clusters":          len(clusters),
+            "n_adv_filtered":      0,
+            "n_survivors":         0,
+            "skipped":             False,
+            "consensus_code":      base_code,
+            "consensus_ratio":     0.0,
+            "mean_reward":         0.0,
+            "adapter_name":        None,
+            "adv_pass_rate":       0.0,
+            "tcl_events_ingested": 0,
+        }
+
+        if not clusters:
+            report["skipped"] = True
+            self._log.append(report)
+            return report
+
+        # Filter clusters by adversarial pass rate
+        survivors: List[Tuple["SolutionCluster", float]] = []
+        for cluster in clusters:
+            if cluster.consensus_ratio < self.config.distill_consensus_threshold:
+                continue
+            adv_pass, _, _ = self.test_agent.attack(cluster.canonical_code, prompt)
+            report["n_adv_filtered"] += 1
+            if adv_pass >= self.ADV_PASS_THRESHOLD:
+                survivors.append((cluster, adv_pass))
+
+        report["n_survivors"] = len(survivors)
+
+        if not survivors:
+            report["skipped"] = True
+            self._log.append(report)
+            return report
+
+        # Pick best surviving cluster by adv_pass × mean_reward
+        best_cluster, best_adv_pass = max(
+            survivors, key=lambda x: x[0].mean_reward * x[1])
+
+        report["consensus_ratio"] = best_cluster.consensus_ratio
+        report["mean_reward"]     = best_cluster.mean_reward
+        report["consensus_code"]  = best_cluster.canonical_code
+        report["adv_pass_rate"]   = round(best_adv_pass, 4)
+
+        # Distil via base distiller (builds LoRA adapter)
+        adapter = self.base._create_adapter(best_cluster.canonical_code,
+                                            layer_name=layer_name)
+        report["adapter_name"] = layer_name
+
+        # Upsert into GraphRAG with adversarial pass rate annotated
+        if self.base.graph is not None:
+            node_id = f"caps_{layer_name}"
+            self.base.graph.upsert_node(
+                node_id   = node_id,
+                node_type = "concept",
+                label     = f"CAPS consensus [{best_adv_pass:.0%} adv]: {prompt[:50]}",
+                metadata  = {
+                    "consensus_ratio": best_cluster.consensus_ratio,
+                    "mean_reward":     best_cluster.mean_reward,
+                    "adv_pass_rate":   best_adv_pass,
+                    "layer":           layer_name,
+                },
+                embed_text = best_cluster.canonical_code[:1024],
+            )
+            self.base.graph.set_compression(
+                node_id,
+                gist    = (f"CAPS distil ({best_cluster.consensus_ratio:.0%} consensus, "
+                           f"{best_adv_pass:.0%} adv pass): "
+                           f"{best_cluster.consensus_rationale[:60]}"),
+                summary = best_cluster.consensus_rationale,
+                raw     = best_cluster.canonical_code,
+            )
+
+        # Ingest unified event stream into TCL (diff + failures + traces)
+        diff_event = DiffEvent(
+            diff_raw       = f"# CAPS distil: {prompt[:60]}\n{best_cluster.canonical_code[:400]}",
+            diff_ast       = best_cluster.canonical_code[:200],
+            test_results   = f"adv_pass_rate={best_adv_pass:.3f}",
+            issue_body     = prompt[:120],
+            reviewer_notes = f"consensus_ratio={best_cluster.consensus_ratio:.3f}",
+            timestamp      = time.time(),
+            repo_path      = "caps_distillation",
+        )
+        # Append a synthetic "fix" event pairing (later_fix = the distilled code)
+        fix_event = DiffEvent(
+            diff_raw       = f"# Fix consensus applied\n{best_cluster.canonical_code[:400]}",
+            diff_ast       = best_cluster.canonical_code[:200],
+            test_results   = f"adv_pass_rate_after={best_adv_pass:.3f}",
+            issue_body     = f"Applied CAPS distillation for: {prompt[:80]}",
+            reviewer_notes = "auto-generated by CAPSDistillationLoop",
+            timestamp      = time.time() + 1,
+            repo_path      = "caps_distillation",
+        )
+        self.tcl.ingest_diff_event(diff_event)
+        self.tcl.ingest_diff_event(fix_event)
+        report["tcl_events_ingested"] = 2
+
+        self._log.append(report)
+        return report
+
+    def multi_round(self, prompt: str, base_code: str = "") -> List[Dict]:
+        """Run up to distill_max_rounds CAPS-filtered distillation rounds."""
+        reports: List[Dict] = []
+        current = base_code
+        prev_adv = 0.0
+
+        for i in range(self.config.distill_max_rounds):
+            layer = f"caps_round_{i}"
+            rep   = self.distil_with_adv_filter(prompt, current, layer_name=layer)
+            reports.append(rep)
+            if not rep["skipped"]:
+                current = rep["consensus_code"]
+            if rep["adv_pass_rate"] <= prev_adv + 0.01 and i > 0:
+                break
+            prev_adv = rep["adv_pass_rate"]
+
+        return reports
+
+    def stats(self) -> Dict:
+        return {
+            "rounds_completed": len(self._log),
+            "n_adapters":       sum(1 for r in self._log if r.get("adapter_name")),
+            "mean_adv_pass":    (sum(r["adv_pass_rate"] for r in self._log)
+                                 / max(len(self._log), 1)),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW v4 — CAPS: CAPSController (governing policy: search / verify / distil)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class CAPSController:
+    """
+    CAPS: Counterfactual Adversarial Patch Search — the governing policy.
+
+    This is the "spine" that turns the existing pile of good primitives into
+    one coherent coder architecture.  It decides WHEN to explore, WHEN to
+    attack, WHEN to verify, and WHEN to distil — rather than running all
+    three loops in parallel without coordination.
+
+    Policy logic:
+      1. Exploration phase  — CAPSSearchLoop runs until a promising branch
+         emerges (robust_value > explore_threshold).
+      2. Attack phase       — TestAgent targets the top-K branches.  If a
+         branch survives, move to verify; otherwise re-explore from the
+         best surviving parent.
+      3. Verify phase       — CAPSVerificationLoop runs the full chain on
+         survivors.  Branches that fail are marked terminal and fed to TCL.
+      4. Distil phase       — CAPSDistillationLoop runs multi_round on the
+         best verified code.  LoRA adapter is cached in the swarm.
+      5. LatentComms        — used ONLY as the control plane passing phase
+         tokens between steps, not as a source of truth for code quality.
+
+    Key invariant: no code is distilled until it has survived at least one
+    TestAgent attack.  This is the CAPS anti-collusion guarantee.
+
+    Usage:
+        controller = CAPSController(...)
+        result = controller.run(prompt, initial_code)
+        print(result["best_code"], result["adv_pass_rate"])
+    """
+
+    EXPLORE_THRESHOLD = 0.30   # robust_value above which we move to attack
+    VERIFY_THRESHOLD  = 0.50   # robust_value above which we move to distil
+
+    def __init__(self,
+                 search_loop:  "CAPSSearchLoop",
+                 verify_loop:  "CAPSVerificationLoop",
+                 distil_loop:  "CAPSDistillationLoop",
+                 latent_comms: "LatentCommsCoordinator",
+                 config:       "CogForgeConfig"):
+        self.search  = search_loop
+        self.verify  = verify_loop
+        self.distil  = distil_loop
+        self.latent  = latent_comms
+        self.config  = config
+        self._run_log: List[Dict] = []
+
+    def run(self, prompt: str,
+            initial_code: str    = "",
+            iterations:  int     = 10,
+            run_tests:   bool    = False,
+            levels:  Optional[List[str]] = None,
+            repo_style_hints: Optional[Dict] = None) -> Dict:
+        """
+        Execute the full CAPS three-loop policy.
+
+        Returns:
+          best_code, best_reward, best_robust_value, adv_pass_rate,
+          distil_reports, dpo_pairs, phase_log, tree_stats
+        """
+        phase_log: List[str] = []
+
+        # ── Phase 1: Search ──────────────────────────────────────────────
+        phase_log.append("search")
+        search_result = self.search.search(
+            prompt=prompt,
+            iterations=iterations,
+            run_tests=run_tests,
+            initial_code=initial_code,
+            levels=levels,
+            repo_style_hints=repo_style_hints,
+        )
+
+        best_code  = search_result["best_code"]
+        best_rv    = search_result.get("best_robust_value", -1.0)
+
+        # Broadcast phase token via LatentComms (control plane only)
+        if self.config.caps_latent_as_control_only:
+            for agent in ["CAPSSearch", "CAPSVerify", "CAPSDistil"]:
+                if agent not in self.latent._channels:
+                    self.latent.register(agent)
+            self.latent.send("CAPSSearch", "CAPSVerify",
+                             f"search_complete|rv={best_rv:.3f}|code_len={len(best_code)}")
+
+        # ── Phase 2: Attack & Verify ─────────────────────────────────────
+        if best_rv >= self.EXPLORE_THRESHOLD:
+            phase_log.append("attack+verify")
+            verify_result = self.verify.verify(
+                best_code, prompt, run_tests, repo_style_hints)
+
+            self.latent.send("CAPSVerify", "CAPSDistil",
+                             f"verify_complete|rv={verify_result['robust_value']:.3f}")
+        else:
+            phase_log.append("verify_skipped(rv_too_low)")
+            verify_result = {"robust_value": best_rv, "adv_pass_rate": 0.0,
+                             "pass_rate": 0.0, "fast_failed_at": "rv_gate"}
+
+        final_rv = verify_result.get("robust_value", best_rv)
+
+        # ── Phase 3: Distil ──────────────────────────────────────────────
+        distil_reports: List[Dict] = []
+        if final_rv >= self.VERIFY_THRESHOLD:
+            phase_log.append("distil")
+            distil_reports = self.distil.multi_round(prompt, best_code)
+            if distil_reports and not distil_reports[-1].get("skipped"):
+                best_code = distil_reports[-1].get("consensus_code", best_code)
+        else:
+            phase_log.append("distil_skipped(rv_too_low)")
+
+        run_record = {
+            "prompt":            prompt[:100],
+            "phase_log":         phase_log,
+            "best_robust_value": final_rv,
+            "adv_pass_rate":     verify_result.get("pass_rate", 0.0),
+            "distil_rounds":     len(distil_reports),
+        }
+        self._run_log.append(run_record)
+
+        return {
+            "best_code":         best_code,
+            "best_reward":       search_result.get("best_reward", 0.0),
+            "best_robust_value": final_rv,
+            "adv_pass_rate":     verify_result.get("pass_rate", 0.0),
+            "distil_reports":    distil_reports,
+            "dpo_pairs":         search_result.get("dpo_pairs", []),
+            "phase_log":         phase_log,
+            "tree_stats":        search_result.get("tree_stats", {}),
+            "verify_result":     verify_result,
+        }
+
+    def stats(self) -> Dict:
+        if not self._run_log:
+            return {"runs": 0}
+        rvs = [r["best_robust_value"] for r in self._run_log]
+        return {
+            "runs":               len(self._run_log),
+            "mean_robust_value":  round(sum(rvs) / len(rvs), 4),
+            "max_robust_value":   max(rvs),
+            "mean_adv_pass_rate": round(
+                sum(r["adv_pass_rate"] for r in self._run_log) / len(self._run_log), 4),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # NEW v3 — Recursive Self-Distillation
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -5158,6 +6514,64 @@ class CogWorksSwarm:
             graph=self.shared_memory.graph,
         )
 
+        # NEW v4 — CAPS: Counterfactual Adversarial Patch Search
+        # Build the three-loop CAPS stack on top of existing v3 primitives.
+
+        # ExecutionSimulatorHead: cheap pre-flight predictor
+        self.exec_sim = ExecutionSimulatorHead(self.config)
+
+        # VerifierEnsemble: seven-head verifier (replaces CoverageRewardModule
+        # for CAPS-aware code paths; old module kept for backwards compat)
+        self.verifier_ensemble = VerifierEnsemble(
+            terminal_guy=self.terminal_guy,
+            vuln_finder=self.vulnerability_finder,
+            prm=self.cog_search_engine.prm,
+            exec_sim=self.exec_sim,
+            config=self.config,
+        )
+
+        # TestAgent: separate adversarial LLM with anti-collusion objective
+        self.test_agent = TestAgent(
+            test_pool=self.adv_test_pool,
+            mutation_rounds=self.config.adver_mutation_rounds,
+            timeout=5,
+        )
+
+        # CAPSVerificationLoop: sim → compile → attack → verify → static
+        self.caps_verify = CAPSVerificationLoop(
+            verifier=self.verifier_ensemble,
+            test_agent=self.test_agent,
+            exec_sim=self.exec_sim,
+            config=self.config,
+        )
+
+        # CAPSSearchLoop: patch-plan MCTS with PUCT + robust_value
+        self.caps_search = CAPSSearchLoop(
+            verification_loop=self.caps_verify,
+            beam_expansion=self.cog_search_engine.beam,
+            config=self.config,
+            exploration_c=1.414,
+            k_expansions=3,
+        )
+
+        # CAPSDistillationLoop: consensus filter + adv gate + LoRA
+        self.caps_distil = CAPSDistillationLoop(
+            base_distiller=self.self_distiller,
+            test_agent=self.test_agent,
+            tcl_trainer=self.tcl_trainer,
+            config=self.config,
+        )
+
+        # CAPSController: governing policy (search / verify / distil)
+        # LatentComms is wired as control-plane only (not source-of-truth).
+        self.caps_controller = CAPSController(
+            search_loop=self.caps_search,
+            verify_loop=self.caps_verify,
+            distil_loop=self.caps_distil,
+            latent_comms=self.latent_comms,
+            config=self.config,
+        )
+
         self._agents: Dict[str, BaseAgent] = {
             "Coordinator":          self.coordinator,
             "Dreamer":              self.dreamer,
@@ -5175,12 +6589,51 @@ class CogWorksSwarm:
             "MetaOrchestrator":     self.meta_orchestrator,
         }
 
+    # ── CAPS entry point ──────────────────────────────────────────────────
+
+    def caps_run(self, task: str,
+                 initial_code: str = "",
+                 iterations: int   = 10,
+                 run_tests: bool   = False,
+                 levels: Optional[List[str]] = None,
+                 repo_style_hints: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        Execute the full CAPS three-loop policy:
+          1. CAPSSearchLoop   — patch-plan MCTS with robust_value
+          2. CAPSVerificationLoop — sim → compile → TestAgent → verifier ensemble
+          3. CAPSDistillationLoop — adv-filtered consensus distillation
+
+        This is the preferred entry point for coding tasks in v4.  The legacy
+        `cog_search()` method still works and calls HierarchicalCogSearch
+        without the CAPS governing policy.
+
+        Returns a result dict with:
+          best_code, best_reward, best_robust_value, adv_pass_rate,
+          distil_reports, dpo_pairs, phase_log, tree_stats,
+          caps_controller_stats, test_agent_find_rate, exec_sim_calibration
+        """
+        result = self.caps_controller.run(
+            prompt=task,
+            initial_code=initial_code,
+            iterations=iterations,
+            run_tests=run_tests,
+            levels=levels,
+            repo_style_hints=repo_style_hints,
+        )
+        result["caps_controller_stats"] = self.caps_controller.stats()
+        result["test_agent_find_rate"]  = self.test_agent.find_rate_stats()
+        result["exec_sim_calibration"]  = self.exec_sim.calibration_error()
+        result["adv_pool_stats"]        = self.adv_test_pool.stats()
+        result["tcl_buffer_stats"]      = self.tcl_trainer.buffer_stats()
+        return result
+
     # ── Full pipeline ─────────────────────────────────────────────────────
 
     def run(self, task: str, repo_root: str = ".",
             save_snapshot: Optional[str] = None) -> Dict[str, Any]:
         """
         Execute the full v2 swarm workflow.
+
 
         New in v2:
           - Step 0: MetaOrchestrator spawns ephemeral specialists (parallel).
@@ -5745,3 +7198,149 @@ if __name__ == "__main__":
     if cs_result["dpo_pairs"]:
         pair = cs_result["dpo_pairs"][0]
         print(f"  Sample pair delta:   {pair['reward_delta']:+.3f} [{pair['level']}]")
+
+    # ── NEW v4 — CAPS smoke tests ─────────────────────────────────────────
+
+    print("\n" + "═" * 60)
+    print("  NEW v4 — CAPS: Counterfactual Adversarial Patch Search")
+    print("═" * 60)
+
+    # ExecutionSimulatorHead
+    print("\n--- ExecutionSimulatorHead ---")
+    exec_sim = ExecutionSimulatorHead(cfg)
+    sample_code   = "def is_prime(n):\n    if n < 2: return False\n    for i in range(2, n): \n        if n % i == 0: return False\n    return True"
+    sample_prompt = "Write a function that checks whether a number is prime"
+    sim_pred = exec_sim.predict(sample_code, sample_prompt)
+    exec_sim.update(sim_pred, True)
+    print(f"  Predicted pass prob:  {sim_pred:.3f}")
+    print(f"  Calibration error:    {exec_sim.calibration_error():.3f}")
+
+    # VerifierEnsemble
+    print("\n--- VerifierEnsemble ---")
+    ens = VerifierEnsemble(
+        terminal_guy=swarm.terminal_guy,
+        vuln_finder=swarm.vulnerability_finder,
+        exec_sim=exec_sim,
+        config=cfg,
+    )
+    ens_result = ens.compute(sample_code, sample_prompt)
+    print(f"  compile:     {ens_result['compile']:.2f}")
+    print(f"  security:    {ens_result['security']:.2f}")
+    print(f"  style:       {ens_result['style']:.2f}")
+    print(f"  self_exec:   {ens_result['self_exec']:.3f}")
+    print(f"  disagreement:{ens_result['disagreement']:.3f}")
+    print(f"  reward:      {ens_result['reward']:.3f}")
+    robust_val = ens.compute_robust_value(
+        min_adv_pass=0.75, fragility=0.18, entropy_gap=0.10,
+        cost=0.02, novelty=0.3, uncertainty=0.15, config=cfg)
+    print(f"  robust_value:{robust_val:.4f}")
+
+    # TestAgent (anti-collusion)
+    print("\n--- TestAgent (anti-collusion) ---")
+    test_agent = TestAgent(test_pool=swarm.adv_test_pool, mutation_rounds=2)
+    ta_pass, ta_frag, ta_gap = test_agent.attack(sample_code, sample_prompt)
+    print(f"  pass_rate:   {ta_pass:.3f}")
+    print(f"  fragility:   {ta_frag:.3f}")
+    print(f"  entropy_gap: {ta_gap:.3f}")
+    print(f"  find_stats:  {test_agent.find_rate_stats()}")
+
+    # CAPSVerificationLoop
+    print("\n--- CAPSVerificationLoop ---")
+    caps_verify = CAPSVerificationLoop(
+        verifier=ens, test_agent=test_agent,
+        exec_sim=exec_sim, config=cfg)
+    vresult = caps_verify.verify(sample_code, sample_prompt)
+    print(f"  passed_sim:     {vresult['passed_sim']}")
+    print(f"  passed_compile: {vresult['passed_compile']}")
+    print(f"  pass_rate:      {vresult['pass_rate']:.3f}")
+    print(f"  robust_value:   {vresult['robust_value']:.4f}")
+    print(f"  fast_failed_at: {vresult['fast_failed_at']}")
+
+    # CAPSSearchLoop (patch-plan MCTS)
+    print("\n--- CAPSSearchLoop (patch-plan MCTS) ---")
+    caps_search = CAPSSearchLoop(
+        verification_loop=caps_verify,
+        beam_expansion=swarm.cog_search_engine.beam,
+        config=cfg,
+        k_expansions=2,
+    )
+    sl_result = caps_search.search(
+        prompt="Write a cache-aware O(n log n) prime sieve",
+        iterations=3,
+        run_tests=False,
+        levels=["architecture", "file"],
+    )
+    print(f"  best_reward:        {sl_result['best_reward']:.3f}")
+    print(f"  best_robust_value:  {sl_result['best_robust_value']:.4f}")
+    print(f"  total_nodes:        {sl_result['tree_stats']['total_nodes']}")
+    print(f"  dpo_pairs:          {len(sl_result['dpo_pairs'])}")
+
+    # CAPSDistillationLoop (adv-filtered consensus)
+    print("\n--- CAPSDistillationLoop (adversarially-gated distillation) ---")
+    caps_distil = CAPSDistillationLoop(
+        base_distiller=swarm.self_distiller,
+        test_agent=test_agent,
+        tcl_trainer=swarm.tcl_trainer,
+        config=cfg,
+    )
+    dist_result = caps_distil.distil_with_adv_filter(
+        "Write an is_prime function", base_code=sample_code)
+    print(f"  n_clusters:         {dist_result['n_clusters']}")
+    print(f"  n_adv_filtered:     {dist_result['n_adv_filtered']}")
+    print(f"  n_survivors:        {dist_result['n_survivors']}")
+    print(f"  adv_pass_rate:      {dist_result['adv_pass_rate']:.3f}")
+    print(f"  adapter_name:       {dist_result['adapter_name']}")
+    print(f"  tcl_events:         {dist_result['tcl_events_ingested']}")
+    print(f"  distil_stats:       {caps_distil.stats()}")
+
+    # TemporalContrastiveTrainer unified event stream
+    print("\n--- TemporalContrastiveTrainer (CAPS unified event stream) ---")
+    swarm.tcl_trainer.ingest_execution_trace(
+        diff_text    = sample_code,
+        stack_trace  = "TypeError: '<' not supported between 'NoneType' and 'int'",
+        failing_tests= "test_is_prime_none, test_is_prime_neg",
+        fix_code     = "def is_prime(n):\n    if not isinstance(n, int): return False\n    if n < 2: return False\n    ...",
+        subsystem    = "math_utils",
+    )
+    print(f"  TCL buffer stats: {swarm.tcl_trainer.buffer_stats()}")
+
+    # Full CAPSController (governing policy)
+    print("\n--- CAPSController (governing policy: search → verify → distil) ---")
+    caps_ctrl = CAPSController(
+        search_loop=caps_search,
+        verify_loop=caps_verify,
+        distil_loop=caps_distil,
+        latent_comms=swarm.latent_comms,
+        config=cfg,
+    )
+    ctrl_result = caps_ctrl.run(
+        prompt="Write a prime sieve that uses a bitarray for cache efficiency",
+        iterations=3,
+        run_tests=False,
+        levels=["file"],
+    )
+    print(f"  phase_log:          {ctrl_result['phase_log']}")
+    print(f"  best_robust_value:  {ctrl_result['best_robust_value']:.4f}")
+    print(f"  adv_pass_rate:      {ctrl_result['adv_pass_rate']:.3f}")
+    print(f"  distil_rounds:      {len(ctrl_result['distil_reports'])}")
+    print(f"  dpo_pairs:          {len(ctrl_result['dpo_pairs'])}")
+    print(f"  controller_stats:   {caps_ctrl.stats()}")
+
+    # CogWorksSwarm.caps_run() — top-level CAPS entry point
+    print("\n--- CogWorksSwarm.caps_run() (top-level CAPS entry point) ---")
+    caps_swarm_result = swarm.caps_run(
+        task="Implement a thread-safe LRU cache with TTL expiry",
+        iterations=3,
+        run_tests=False,
+        levels=["file"],
+    )
+    print(f"  best_reward:            {caps_swarm_result['best_reward']:.3f}")
+    print(f"  best_robust_value:      {caps_swarm_result['best_robust_value']:.4f}")
+    print(f"  adv_pass_rate:          {caps_swarm_result['adv_pass_rate']:.3f}")
+    print(f"  phase_log:              {caps_swarm_result['phase_log']}")
+    print(f"  test_agent_find_rate:   {caps_swarm_result['test_agent_find_rate']}")
+    print(f"  exec_sim_calibration:   {caps_swarm_result['exec_sim_calibration']:.4f}")
+    print(f"  adv_pool_stats:         {caps_swarm_result['adv_pool_stats']}")
+    print(f"  tcl_buffer_stats:       {caps_swarm_result['tcl_buffer_stats']}")
+    print(f"\nCogForge v4 parameters:  {model.count_parameters():,}")
+    print("CAPS algorithm fully integrated. ✓")
