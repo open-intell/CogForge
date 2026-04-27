@@ -1,115 +1,161 @@
 # CogForge + CogWorks Swarm
 
-**A lightweight, memory-augmented coding & reasoning transformer with a native multi-agent software engineering swarm.**
+**A memory-augmented coding & reasoning transformer with a native multi-agent software engineering team and execution-guided search.**
 
-Built from the ground up to **digest huge amounts of code without forgetting** while producing maintainable, Google-style high-quality software.
+Designed from the ground up to **digest massive codebases without forgetting** while producing high-quality, maintainable, Google-style code through structured collaboration and adaptive test-time compute.
 
 ---
 
 ## Overview
 
-**CogForge** is a ~100M parameter transformer specifically designed for long-context coding and deep reasoning.  
-**CogWorks** is a team of 11 specialized agents that collaborate using structured handoffs, shared hierarchical memory, and a principled engineering workflow heavily influenced by [Google's Engineering Practices](https://google.github.io/eng-practices/).
+**CogForge** is a ~100M parameter transformer optimized for long-context coding and deep reasoning.
 
-The system combines:
-- Modern transformer optimizations
-- Persistent hierarchical memory (Dreamer)
-- Adaptive computation
-- Repo-level cross-attention (Architect)
-- A native multi-agent orchestration layer
+**CogWorks** is a team of 13 specialized agents that work together using clean handoffs, shared hierarchical memory, and principled engineering practices.
 
-The goal is **continuous improvement of code health** rather than one-shot benchmark chasing.
+**CogSearch** is an execution-guided Monte Carlo Tree Search (MCTS) layer that enables systematic exploration of code solutions with internal (VerifierHead) and external (TerminalGuy) evaluation.
+
+The entire system is heavily influenced by **Google's Engineering Practices**, emphasizing continuous improvement of code health over one-shot perfection.
 
 ---
 
 ## Key Features
 
-### CogForge Architecture Highlights
+### CogForge Architecture
 
-- **Grouped-Query Attention (GQA)** with sliding window (local efficiency)
-- **Rotary Positional Embeddings (RoPE)**
-- **True O(T) Linear Lookback Attention** – recurrent formulation for long-range context (fixed memory)
-- **Hierarchical Memory Module** – persistent external memory with gated updates and cross-attention reads
-- **Adaptive Computation Time (ACT)** blocks – variable compute per token for hard reasoning
-- **Dynamic Latent Reasoning Tokens** – automatically expands thinking budget on complex tasks
-- **Architect Cross-Attention** – repo-level context injection at layers 4, 8, and 10
-- **SwiGLU** feed-forward + **RMSNorm** throughout
-- **Verifier Head** – learned correctness scoring
-- **Handoff Projection Head** – recommends next agent in the swarm
+- Grouped-Query Attention (GQA) with Sliding Window
+- Rotary Positional Embeddings (RoPE)
+- True O(T) Linear Lookback Attention (recurrent formulation)
+- **Hierarchical Memory Module** (Dreamer-managed persistent memory with gated updates + cross-attention reads)
+- Adaptive Computation Time (ACT) blocks with dynamic latent reasoning tokens
+- Architect Cross-Attention for repo-level context injection
+- SwiGLU + RMSNorm
+- VerifierHead for learned correctness scoring
+- Handoff projection head for swarm coordination
 
-**Parameter count**: ~100M (easily scalable)
+### CogSearch – Execution-Guided MCTS
 
-### CogWorks Swarm Agents
+- UCT-based node selection (exploration vs exploitation)
+- Multi-branch expansion driven by ProblemSolver
+- Two-level evaluation:
+  - Level 1: VerifierHead (fast internal scoring)
+  - Level 2: TerminalGuy (compilation + pytest execution)
+- Reward model: syntax error (-1.0), logic flaw (0.1), passes tests (1.0)
+- Automatic DPO pair collection for future preference fine-tuning
+- Backpropagation of rewards through the code-state tree
 
-| Agent                  | Role |
-|------------------------|------|
-| **Coordinator**        | Task routing, quality gates, orchestration |
-| **Dreamer**            | Hierarchical memory management & consolidation |
-| **Explorer**           | Repository mapping, complexity analysis, flagging |
-| **Planner**            | Task decomposition into DAGs |
-| **ProblemSolver**      | Deep reasoning over resources and constraints |
-| **Engineer**           | Refactoring toward clean, efficient, idiomatic code |
-| **BugFinder**          | Logical error detection with pattern-based scanning |
-| **VulnerabilityFinder**| Security vulnerability scanning (CWE-aware) |
-| **Pessimist**          | Devil's advocate – stress testing plans & code |
-| **TerminalGuy**        | Sandboxed shell execution with safety checks |
-| **Documentor**         | Automatic docstring and comment generation |
+### CogWorks Swarm Agents (13 total)
+
+| Agent                | Role |
+|----------------------|------|
+| **Coordinator**      | Task routing, quality gates, orchestration |
+| **Dreamer**          | Hierarchical memory management & consolidation |
+| **Explorer**         | Repository mapping + complexity flagging |
+| **Archeologist**     | Git history & temporal intent analysis (volatile/stale/caution zones) |
+| **Nexus**            | Dependency auditing, API RAG cache, hallucination detection |
+| **Planner**          | Task decomposition into DAGs |
+| **ProblemSolver**    | Deep expert reasoning + MCTS expansion |
+| **Engineer**         | Clean, efficient refactoring |
+| **BugFinder**        | Logical error detection |
+| **VulnerabilityFinder** | Security scanning (CWE-aware) |
+| **Pessimist**        | Devil's advocate & stress testing |
+| **TerminalGuy**      | Sandboxed command execution (MCTS oracle) |
+| **Documentor**       | Docstrings, comments, and README generation |
+
+**New capability**: **Agent Group Cloning** — Agents can dynamically clone themselves (exact same weights) for extra-long or high-stakes reasoning tasks, run in parallel, and merge results via verifier scoring and Dreamer consolidation.
 
 ---
 
 ## How It Works
 
-### 1. Memory System (The "Not Forgetting" Solution)
+### Memory System (Core "No Forgetting" Mechanism)
 
-- **HierarchicalMemory**: 128 learnable memory slots
-- **Update mechanism**: Gated additive updates with decay on recent hidden states (every ~256 tokens)
-- **Read mechanism**: Lightweight cross-attention from current hidden states to memory slots
-- **Consolidation**: Periodic summarization into dedicated summary slot (managed by Dreamer)
-- Injected into the last `n_memory_layers` transformer blocks
+- **HierarchicalMemory**: 128 learnable slots with gated additive updates and cross-attention reads
+- Periodic updates from recent hidden states + full-context consolidation
+- Injected into deeper transformer blocks
+- Managed centrally by the **Dreamer** agent
 
-This gives the model effective **infinite context** for repository-scale work while staying computationally efficient.
+This gives the swarm effective **infinite context** for large repositories.
 
-### 2. Swarm Orchestration Flow
+### Swarm Workflow
 
-Typical workflow for a user task:
+1. **Coordinator** receives task → launches **Planner** + **Explorer** in parallel
+2. **Archeologist** builds temporal map from git history (flags volatile/stale/caution zones)
+3. **Nexus** audits dependencies and builds RAG cache for APIs
+4. **Dreamer** injects relevant memory context
+5. **Planner** creates DAG → **ProblemSolver** refines strategy
+6. **Engineer** → **Pessimist** critique → **BugFinder** + **VulnerabilityFinder** review
+7. **TerminalGuy** runs tests/commands
+8. **Documentor** adds documentation
+9. **Coordinator** applies quality gate
+10. **Dreamer** consolidates learnings
 
-1. **Coordinator** receives task → delegates to **Planner** + **Explorer** in parallel
-2. **Dreamer** injects relevant episodic + repo context
-3. **Planner** produces a DAG of subtasks
-4. **ProblemSolver** annotates the DAG with resource-aware strategy
-5. **Engineer** → **Pessimist** (critique) → **BugFinder** + **VulnerabilityFinder** (review)
-6. **TerminalGuy** executes tests/commands
-7. **Documentor** adds documentation
-8. **Coordinator** applies quality gate using verifier proxy score
-9. **Dreamer** consolidates learnings into long-term memory
+For hard reasoning tasks, agents can **self-clone** into groups (e.g. 4–8 identical instances) to explore diverse paths in parallel.
 
-All communication happens via **HandoffMessage** objects logged in `SharedMemoryStore`.
+### CogSearch MCTS
 
-### 3. Google Engineering Practices Integration
-
-The swarm is explicitly designed around Google’s code review philosophy:
-- Prioritize **overall code health** over perfection
-- Favor small, incremental improvements
-- Focus reviews on **design, functionality, complexity, tests, naming, comments, style**
-- Be kind and explain reasoning
-
-This bias is baked into agent behavior (especially Engineer, BugFinder, Pessimist, Documentor, and Coordinator).
+When deep code generation is needed, **ProblemSolver** can invoke CogSearch:
+- Selects promising partial solutions using UCT
+- Expands branches with diverse strategies
+- Evaluates with VerifierHead + actual execution
+- Backpropagates rewards
+- Produces best code + DPO training pairs
 
 ---
 
-## Technical Architecture Details
+## Technical Highlights
 
-### CogForge Forward Pass
+- **True linear-time long-range attention** via recurrent Linear Lookback
+- **Dynamic latent tokens** that expand on complex tasks
+- **Agent cloning / group reasoning** for test-time compute scaling
+- **Execution-guided search** (CogSearch) combining neural scoring and real execution
+- **Temporal awareness** via Archeologist (git history intent)
+- **Dependency safety** via Nexus RAG cache
+- Structured, observable communication via `HandoffMessage`
+- Google Engineering Practices baked into agent behavior
+
+---
+
+## Project Structure
+cogforge/
+├── config.py
+├── model.py                 # CogForge transformer
+├── memory.py
+├── mcts.py                  # CogSearch implementation
+├── agents/
+│   ├── base.py
+│   ├── coordinator.py
+│   ├── dreamer.py
+│   ├── archeologist.py
+│   ├── nexus.py
+│   ├── problem_solver.py
+│   └── ...
+├── swarm.py                 # CogWorksSwarm orchestrator
+├── utils.py
+└── main.py
+text---
+
+## Usage
 
 ```python
-x = embed(input_ids)
-x = prepend_latent_tokens(x)           # dynamic expansion possible
-for each block:
-    local GQA
-    linear lookback (O(T) recurrent)
-    optional hierarchical memory read (cross-attn)
-    optional Architect repo cross-attn
-    SwiGLU FFN
-    (ACT wrapping on deeper layers)
-memory.update() → memory.consolidate()
-logits = lm_head(x)
+from cogforge.model import CogForge, CogForgeConfig
+from cogforge.swarm import CogWorksSwarm
+
+config = CogForgeConfig()
+model = CogForge(config)
+swarm = CogWorksSwarm(model=model, config=config)
+
+# Full swarm pipeline
+results = swarm.run(
+    task="Refactor the authentication module for better security and testability",
+    repo_root="."
+)
+
+# Or use CogSearch directly for hard generation tasks
+search_result = swarm.cog_search(
+    prompt="Write a fast prime-checking function with early exit optimization",
+    iterations=12,
+    run_tests=True,
+    k_expansions=4
+)
+
+print("Best code reward:", search_result["best_reward"])
