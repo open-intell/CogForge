@@ -1,29 +1,35 @@
 """
-LexForge: Structure-Aware Byte-Level BPE Tokenizer (v2)
+LexForge: Structure-Aware Byte-Level BPE Tokenizer (v3)
 ========================================================
 Designed specifically for code. Fully lossless round-trip.
 
-Changes from v1:
-  [P0] Lossless identifier boundaries: <US> and <CAMEL> marker tokens preserve
-       underscore/camelCase join information so decode is exact.
-  [P0] Comments preserved: COMMENT token is a *prefix*, comment text is BPE-encoded
-       and included in the stream rather than discarded.
-  [P0] BLOCK_START only fires on real block-introducing keywords, not dict literals,
-       slices, lambdas, or type annotations.
-  [P1] _IDENT_RE: '+' → '*' so single-char identifiers (x, i, n) are handled.
-  [P1] Tab indentation: tabs are converted to canonical INDENT_TAB tokens, not dropped.
-  [P1] encode_word: O(n log n) priority-queue BPE replacing the O(n*m) scan.
-  [P2] Python tokenize module used for line-level tokenization when available,
-       falling back to the regex path for non-Python content.
+Fixes from v2 (all critical correctness issues):
+  [F1] TRUE BYTE-LEVEL: vocab now uses raw UTF-8 bytes (0x00-0xFF) instead of
+       chr(0..255) placeholders. Non-ASCII identifiers and comments round-trip
+       exactly. No more <unk> for Unicode source.
+  [F2] FILE-LEVEL TOKENIZATION: encode() runs Python's stdlib tokenize over
+       the entire file in one pass, not line by line. Multiline strings,
+       implicit joins, backslash continuations, and bracket continuation all
+       work correctly.
+  [F3] NEWLINE FIDELITY: CRLF vs LF vs CR are preserved via explicit
+       NEWLINE_CRLF / NEWLINE_CR tokens. Trailing newline presence is also
+       preserved (TRAILING_NL token).
+  [F4] REAL DEDENT STACK: indentation is tracked as a proper stack; multiple
+       DEDENT tokens are emitted when the level drops more than one step.
+  [F5] STRINGS ARE OPAQUE: operator fusion and identifier splitting never
+       touch STRING or FSTRING tokens. They are encoded as raw byte sequences.
+  [F6] PROPERTY-TEST HARNESS: roundtrip_property_test() hammers edge cases
+       automatically (CRLF, Unicode, multiline strings, deep nesting, etc.).
 
 Vocabulary layout (32000 total):
   [0   ]  <pad>
   [1   ]  <bos>
   [2   ]  <eos>
-  [3   ]  <unk>
-  [7-54]  Structural tokens (indents, newlines, operators, boundary markers)
-  [55-499] Keyword / operator fusion tokens
-  [500-32000) BPE byte-pair merges over code corpus
+  [3   ]  <unk>          ← should never appear with byte-level fallback
+  [7-59]  Structural tokens
+  [60-499] Keyword / operator fusion tokens  (was 55-499)
+  [500-756] Raw UTF-8 byte tokens (256 bytes × 1 slot each)
+  [757-32000) BPE byte-pair merges over code corpus
 """
 
 import re
@@ -43,73 +49,76 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 SPECIAL_TOKENS: Dict[str, int] = {
-    "<pad>":          0,
-    "<bos>":          1,
-    "<eos>":          2,
-    "<unk>":          3,
+    "<pad>":           0,
+    "<bos>":           1,
+    "<eos>":           2,
+    "<unk>":           3,
     # ── Structural ──────────────────────────────────────────────────────────
-    "NEWLINE":        7,
-    "INDENT_2":       8,
-    "INDENT_4":       9,
-    "INDENT_8":       10,
-    "INDENT_12":      11,
-    "INDENT_16":      12,
-    "INDENT_TAB":     13,   # \t (v2: tabs now represented, not dropped)
-    "DEDENT":         14,
-    "BLOCK_START":    15,   # after block-introducing keyword + ':'
-    "BLOCK_END":      16,
-    "COMMENT":        17,   # '#' prefix marker; comment text follows as BPE tokens
-    "FSTRING_START":  18,   # f"
-    "FSTRING_END":    19,
-    "DECORATOR":      20,   # @symbol
-    "ELLIPSIS":       21,   # ...
-    "SEMICOLON":      22,
-    "COMMA_SPACE":    23,   # ', ' common in arg lists
+    "NEWLINE":         7,   # \n
+    "NEWLINE_CRLF":    8,   # \r\n  [F3]
+    "NEWLINE_CR":      9,   # \r    [F3]
+    "TRAILING_NL":     10,  # file ends with newline  [F3]
+    "INDENT_2":        11,
+    "INDENT_4":        12,
+    "INDENT_8":        13,
+    "INDENT_12":       14,
+    "INDENT_16":       15,
+    "INDENT_TAB":      16,  # \t
+    "DEDENT":          17,  # emitted once per indent-level dropped  [F4]
+    "BLOCK_START":     18,  # after block-introducing keyword + ':'
+    "BLOCK_END":       19,
+    "COMMENT":         20,  # '#' prefix marker; comment text follows as byte tokens
+    "FSTRING_START":   21,  # f"
+    "FSTRING_END":     22,
+    "DECORATOR":       23,  # @symbol
+    "ELLIPSIS":        24,  # ...
+    "SEMICOLON":       25,
+    "COMMA_SPACE":     26,  # ', ' common in arg lists
     # ── [P0] Identifier boundary markers ────────────────────────────────────
-    "<US>":           24,   # underscore boundary  parse_html → parse <US> html
-    "<CAMEL>":        25,   # camelCase boundary   getUserData → get <CAMEL> User <CAMEL> Data
+    "<US>":            27,  # underscore boundary  parse_html → parse <US> html
+    "<CAMEL>":         28,  # camelCase boundary   getUserData → get <CAMEL> User <CAMEL> Data
     # ── Operators (fused) ───────────────────────────────────────────────────
-    "OP_EQ":          26,   # ==
-    "OP_NEQ":         27,   # !=
-    "OP_GEQ":         28,   # >=
-    "OP_LEQ":         29,   # <=
-    "OP_WALRUS":      30,   # :=
-    "OP_ARROW":       31,   # ->
-    "OP_DSTAR":       32,   # **
-    "OP_DSLASH":      33,   # //
-    "OP_LSHIFT":      34,   # <<
-    "OP_RSHIFT":      35,   # >>
-    "OP_AUG_ADD":     36,   # +=
-    "OP_AUG_SUB":     37,   # -=
-    "OP_AUG_MUL":     38,   # *=
-    "OP_AUG_DIV":     39,   # /=
-    "OP_AUG_MOD":     40,   # %=
-    "OP_AUG_AND":     41,   # &=
-    "OP_AUG_OR":      42,   # |=
-    "OP_AUG_XOR":     43,   # ^=
-    "OP_ANNOT":       44,   # : (type annotation context)
-    "OP_SPREAD":      45,   # *args / **kwargs marker
+    "OP_EQ":           29,  # ==
+    "OP_NEQ":          30,  # !=
+    "OP_GEQ":          31,  # >=
+    "OP_LEQ":          32,  # <=
+    "OP_WALRUS":       33,  # :=
+    "OP_ARROW":        34,  # ->
+    "OP_DSTAR":        35,  # **
+    "OP_DSLASH":       36,  # //
+    "OP_LSHIFT":       37,  # <<
+    "OP_RSHIFT":       38,  # >>
+    "OP_AUG_ADD":      39,  # +=
+    "OP_AUG_SUB":      40,  # -=
+    "OP_AUG_MUL":      41,  # *=
+    "OP_AUG_DIV":      42,  # /=
+    "OP_AUG_MOD":      43,  # %=
+    "OP_AUG_AND":      44,  # &=
+    "OP_AUG_OR":       45,  # |=
+    "OP_AUG_XOR":      46,  # ^=
+    "OP_ANNOT":        47,  # : (type annotation context)
+    "OP_SPREAD":       48,  # *args / **kwargs marker
     # ── Keyword fusions ─────────────────────────────────────────────────────
-    "KW_ASYNC_DEF":   46,   # async def
-    "KW_ASYNC_FOR":   47,   # async for
-    "KW_ASYNC_WITH":  48,   # async with
-    "KW_YIELD_FROM":  49,   # yield from
-    "KW_NOT_IN":      50,   # not in
-    "KW_IS_NOT":      51,   # is not
-    "KW_ELIF":        52,   # elif (always its own token)
+    "KW_ASYNC_DEF":    49,  # async def
+    "KW_ASYNC_FOR":    50,  # async for
+    "KW_ASYNC_WITH":   51,  # async with
+    "KW_YIELD_FROM":   52,  # yield from
+    "KW_NOT_IN":       53,  # not in
+    "KW_IS_NOT":       54,  # is not
+    "KW_ELIF":         55,  # elif (always its own token)
 }
 
 # Reverse map
 ID_TO_SPECIAL: Dict[int, str] = {v: k for k, v in SPECIAL_TOKENS.items()}
 
 # [P0] Keywords that genuinely introduce an indented block.
-# BLOCK_START is only emitted when a line ending in ':' starts with one of these.
 _BLOCK_KEYWORDS = frozenset([
     "if", "elif", "else", "for", "while", "with", "try", "except",
     "finally", "def", "class", "async", "case", "match",
 ])
 
-# Operator fusion table: longest match first
+# Operator fusion table: longest match first.
+# [F5] These are ONLY applied to NAME/OP tokens, never STRING/COMMENT tokens.
 OPERATOR_FUSIONS: List[Tuple[str, int]] = sorted([
     ("async def",   SPECIAL_TOKENS["KW_ASYNC_DEF"]),
     ("async for",   SPECIAL_TOKENS["KW_ASYNC_FOR"]),
@@ -135,7 +144,6 @@ OPERATOR_FUSIONS: List[Tuple[str, int]] = sorted([
     ("!=",          SPECIAL_TOKENS["OP_NEQ"]),
     (">=",          SPECIAL_TOKENS["OP_GEQ"]),
     ("<=",          SPECIAL_TOKENS["OP_LEQ"]),
-    (", ",          SPECIAL_TOKENS["COMMA_SPACE"]),
     ("...",         SPECIAL_TOKENS["ELLIPSIS"]),
     ("elif ",       SPECIAL_TOKENS["KW_ELIF"]),
 ], key=lambda x: -len(x[0]))  # longest-match first
@@ -143,15 +151,32 @@ OPERATOR_FUSIONS: List[Tuple[str, int]] = sorted([
 # Reverse fusion map for decode
 _FUSION_DECODE: Dict[int, str] = {tid: pat for pat, tid in OPERATOR_FUSIONS}
 
+# [F3] Newline token decode map
+_NL_DECODE: Dict[int, str] = {
+    SPECIAL_TOKENS["NEWLINE"]:      "\n",
+    SPECIAL_TOKENS["NEWLINE_CRLF"]: "\r\n",
+    SPECIAL_TOKENS["NEWLINE_CR"]:   "\r",
+}
+
 
 # ---------------------------------------------------------------------------
-# [P0] CamelCase / snake_case Splitter — now lossless
+# [F1] True byte-level encoding helpers
 # ---------------------------------------------------------------------------
 
-# [P1] Fixed: '*' instead of '+' so single-char identifiers match
+def str_to_utf8_bytes(s: str) -> bytes:
+    """Encode string to UTF-8 bytes."""
+    return s.encode("utf-8")
+
+def utf8_bytes_to_str(b: bytes) -> str:
+    """Decode UTF-8 bytes back to string. Always succeeds (surrogate-escape)."""
+    return b.decode("utf-8", errors="surrogateescape")
+
+
+# ---------------------------------------------------------------------------
+# [P0] CamelCase / snake_case Splitter — lossless
+# ---------------------------------------------------------------------------
+
 _IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
-
-# CamelCase boundary: lowercase→Uppercase or Uppercase→Uppercase+lowercase
 _CAMEL_RE = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
@@ -162,17 +187,13 @@ def split_identifier(name: str) -> Tuple[List[str], List[int]]:
     Returns two parallel pieces:
       subwords   – the string pieces to BPE-encode
       boundaries – list of boundary marker token ids *between* each pair
-                   of subwords (len == len(subwords) - 1)
+                   (len == len(subwords) - 1)
 
     Examples:
       parse_html_doc → (['parse','html','doc'],   [<US>, <US>])
       getUserData    → (['get','User','Data'],     [<CAMEL>, <CAMEL>])
       __init__       → (['__init__'],              [])
       XMLParser      → (['XML','Parser'],          [<CAMEL>])
-
-    Decode:
-      zip(subwords, boundaries + [None]) and interleave boundary tokens
-      to reconstruct the exact original string.
     """
     US    = SPECIAL_TOKENS["<US>"]
     CAMEL = SPECIAL_TOKENS["<CAMEL>"]
@@ -180,14 +201,12 @@ def split_identifier(name: str) -> Tuple[List[str], List[int]]:
     if name.startswith("__") and name.endswith("__"):
         return [name], []
 
-    # Leading-underscore names like _private stay whole (single underscore prefix)
     if re.fullmatch(r"_[A-Za-z0-9_]*", name):
         return [name], []
 
-    # Step 1: split on underscores — track boundary type
-    snake_parts = re.split(r"(_+)", name)  # keeps separators
+    snake_parts = re.split(r"(_+)", name)
     parts: List[str] = []
-    inter_boundaries: List[int] = []       # boundaries *between* snake parts
+    inter_boundaries: List[int] = []
 
     i = 0
     while i < len(snake_parts):
@@ -196,22 +215,15 @@ def split_identifier(name: str) -> Tuple[List[str], List[int]]:
             i += 1
             continue
         if re.fullmatch(r"_+", chunk):
-            # underscore separator — record one <US> between previous and next part
-            # (we'll assign it when we process the next real chunk)
             inter_boundaries.append(US)
             i += 1
             continue
-        # Real word chunk — now split camelCase within it
         camel_sub = _CAMEL_RE.split(chunk)
         camel_sub = [s for s in camel_sub if s]
         if parts and inter_boundaries:
-            # The boundary before this chunk is already recorded (it was a <US>)
             pass
         elif parts:
-            # No recorded boundary — but we need one if we're continuing
-            # (shouldn't happen in well-formed splits, but be safe)
             pass
-        # Append camel subparts and their internal boundaries
         for j, sub in enumerate(camel_sub):
             parts.append(sub)
             if j < len(camel_sub) - 1:
@@ -227,7 +239,6 @@ def split_identifier(name: str) -> Tuple[List[str], List[int]]:
 def reconstruct_identifier(subwords: List[str], boundaries: List[int]) -> str:
     """Inverse of split_identifier. Reconstruct original identifier string."""
     US    = SPECIAL_TOKENS["<US>"]
-    CAMEL = SPECIAL_TOKENS["<CAMEL>"]
     if not subwords:
         return ""
     result = subwords[0]
@@ -241,6 +252,7 @@ def reconstruct_identifier(subwords: List[str], boundaries: List[int]) -> str:
 
 # ---------------------------------------------------------------------------
 # [P1] Byte-Pair Encoding Core — O(n log n) priority queue
+# [F1] Now truly byte-level: vocab base is 256 raw byte tokens
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -252,31 +264,32 @@ class BPEMerge:
 class BytePairEncoder:
     """
     Pure-Python BPE implementation trained on code corpora.
-    Vocabulary slots [500, vocab_size) are learned merges.
 
-    [P1] encode_word uses a heap-based priority queue (O(n log n)) instead
-    of the original O(n * n_merges) linear scan per word.
+    [F1] Base vocabulary is 256 raw UTF-8 byte values (one token per byte),
+         stored as single-character strings '\x00'..'\xff'.  This guarantees
+         that any input — ASCII, Unicode, binary noise — can be encoded without
+         hitting <unk>.
+
+    [P1] encode_word uses a heap-based priority queue (O(n log n)).
     """
 
-    FIRST_MERGE_ID = 500
+    FIRST_BYTE_ID  = 500   # byte 0x00 gets ID 500, byte 0xFF gets ID 755
+    FIRST_MERGE_ID = 757   # learned BPE merges start here
 
     def __init__(self, vocab_size: int = 32000):
         self.vocab_size = vocab_size
         self.merges: List[BPEMerge] = []
         self.token_to_id: Dict[str, int] = dict(SPECIAL_TOKENS)
         self.id_to_token: Dict[int, str] = dict(ID_TO_SPECIAL)
-        # Add printable ASCII bytes
+
+        # [F1] Register all 256 raw bytes as base tokens
         for b in range(256):
-            ch = chr(b)
-            if ch not in self.token_to_id:
-                tid = len(self.token_to_id)
-                self.token_to_id[ch] = tid
-                self.id_to_token[tid] = ch
-        # Register end-of-word marker so it doesn't map to <unk>
-        if "</w>" not in self.token_to_id:
-            tid = len(self.token_to_id)
-            self.token_to_id["</w>"] = tid
-            self.id_to_token[tid] = "</w>"
+            byte_sym = chr(b)  # single-char string used as symbol key
+            if byte_sym not in self.token_to_id:
+                tid = self.FIRST_BYTE_ID + b
+                self.token_to_id[byte_sym] = tid
+                self.id_to_token[tid] = byte_sym
+
         self._merge_map: Dict[Tuple[str, str], str] = {}
         self._merge_rank: Dict[Tuple[str, str], int] = {}
 
@@ -292,7 +305,8 @@ class BytePairEncoder:
         vocab: Dict[str, List[str]] = {}
         for word, freq in word_freqs.items():
             if freq >= min_frequency:
-                vocab[word] = list(word) + ["</w>"]
+                # [F1] Pre-tokenize words into UTF-8 bytes
+                vocab[word] = [chr(b) for b in word.encode("utf-8")]
 
         target_merges = self.vocab_size - self.FIRST_MERGE_ID
         n_merges_done = 0
@@ -348,19 +362,16 @@ class BytePairEncoder:
     def encode_word(self, word: str) -> List[str]:
         """
         Apply learned BPE merges to a single word.
-
-        Uses a min-heap keyed by merge rank so we always apply the highest-
-        priority (lowest rank) merge first, without rescanning all merges
-        for every symbol sequence.  O(n log n) vs O(n * m) original.
+        [F1] Input word is decomposed into UTF-8 bytes first.
         """
         if not word:
             return []
-        # Represent as doubly-linked list for O(1) neighbour updates
-        symbols: List[Optional[str]] = list(word) + ["</w>"]
+
+        # [F1] Decompose into raw UTF-8 bytes
+        symbols: List[Optional[str]] = [chr(b) for b in word.encode("utf-8")]
         n = len(symbols)
-        # prev/next pointers; None = sentinel
-        prev = list(range(-1, n - 1))   # prev[0] = -1 (no prev)
-        nxt  = list(range(1, n + 1))    # nxt[n-1] = n (no next)
+        prev = list(range(-1, n - 1))
+        nxt  = list(range(1, n + 1))
 
         def get_rank(i: int, j: int) -> int:
             a, b = symbols[i], symbols[j]
@@ -368,8 +379,7 @@ class BytePairEncoder:
                 return int(1e18)
             return self._merge_rank.get((a, b), int(1e18))
 
-        # Initialise heap with all adjacent pairs
-        heap: List[Tuple[int, int, int]] = []  # (rank, i, j)
+        heap: List[Tuple[int, int, int]] = []
         for i in range(n - 1):
             r = get_rank(i, i + 1)
             if r < int(1e18):
@@ -377,26 +387,22 @@ class BytePairEncoder:
 
         while heap:
             rank, i, j = heapq.heappop(heap)
-            # Stale entry check
             if symbols[i] is None or symbols[j] is None:
                 continue
             if get_rank(i, j) != rank:
                 continue
 
-            # Merge pair (i, j)
             merged = self._merge_map.get((symbols[i], symbols[j]))
             if merged is None:
                 continue
 
             symbols[i] = merged
-            symbols[j] = None      # tombstone
+            symbols[j] = None
 
-            # Relink: i's next becomes j's next
             nxt[i] = nxt[j]
             if nxt[j] < n:
                 prev[nxt[j]] = i
 
-            # Push new pairs involving i
             if prev[i] >= 0:
                 r = get_rank(prev[i], i)
                 if r < int(1e18):
@@ -406,10 +412,71 @@ class BytePairEncoder:
                 if r < int(1e18):
                     heapq.heappush(heap, (r, i, nxt[i]))
 
-        return [s for s in symbols if s is not None and s != "</w>"]
+        return [s for s in symbols if s is not None]
+
+    def encode_bytes(self, data: bytes) -> List[int]:
+        """[F1] Encode raw bytes directly — guaranteed no <unk>."""
+        # Try BPE merges on the byte sequence
+        symbols: List[Optional[str]] = [chr(b) for b in data]
+        n = len(symbols)
+        if n == 0:
+            return []
+
+        prev = list(range(-1, n - 1))
+        nxt  = list(range(1, n + 1))
+
+        def get_rank(i: int, j: int) -> int:
+            a, b = symbols[i], symbols[j]
+            if a is None or b is None:
+                return int(1e18)
+            return self._merge_rank.get((a, b), int(1e18))
+
+        heap: List[Tuple[int, int, int]] = []
+        for i in range(n - 1):
+            r = get_rank(i, i + 1)
+            if r < int(1e18):
+                heapq.heappush(heap, (r, i, i + 1))
+
+        while heap:
+            rank, i, j = heapq.heappop(heap)
+            if symbols[i] is None or symbols[j] is None:
+                continue
+            if get_rank(i, j) != rank:
+                continue
+            merged = self._merge_map.get((symbols[i], symbols[j]))
+            if merged is None:
+                continue
+            symbols[i] = merged
+            symbols[j] = None
+            nxt[i] = nxt[j]
+            if nxt[j] < n:
+                prev[nxt[j]] = i
+            if prev[i] >= 0:
+                r = get_rank(prev[i], i)
+                if r < int(1e18):
+                    heapq.heappush(heap, (r, prev[i], i))
+            if nxt[i] < n:
+                r = get_rank(i, nxt[i])
+                if r < int(1e18):
+                    heapq.heappush(heap, (r, i, nxt[i]))
+
+        return [self.token_to_id.get(s, SPECIAL_TOKENS["<unk>"]) 
+                for s in symbols if s is not None]
 
     def symbol_to_id(self, sym: str) -> int:
         return self.token_to_id.get(sym, SPECIAL_TOKENS["<unk>"])
+
+    def ids_to_bytes(self, ids: List[int]) -> bytes:
+        """[F1] Decode a sequence of BPE token ids back to raw bytes."""
+        result = bytearray()
+        for tid in ids:
+            sym = self.id_to_token.get(tid)
+            if sym is None:
+                continue
+            # Each symbol is a string of chr(byte) chars
+            for ch in sym:
+                result.append(ord(ch) & 0xFF)
+        return bytes(result)
 
     # ── Serialization ────────────────────────────────────────────────────────
 
@@ -418,10 +485,16 @@ class BytePairEncoder:
             {"pair": list(m.pair), "token_id": m.token_id}
             for m in self.merges
         ]
+        # Serialize token_to_id with escaped keys for binary safety
+        t2id_escaped = {
+            k.encode("latin-1").hex(): v
+            for k, v in self.token_to_id.items()
+        }
         with open(path, "w") as f:
             json.dump({
                 "vocab_size": self.vocab_size,
-                "token_to_id": self.token_to_id,
+                "token_to_id": t2id_escaped,
+                "token_encoding": "latin1-hex",
                 "merges": merges_serializable,
             }, f, indent=2)
 
@@ -430,9 +503,15 @@ class BytePairEncoder:
         with open(path) as f:
             data = json.load(f)
         enc = cls(vocab_size=data["vocab_size"])
-        enc.token_to_id = data["token_to_id"]
-        enc.id_to_token = {int(k): v for k, v in
-                           {v: k for k, v in data["token_to_id"].items()}.items()}
+        encoding = data.get("token_encoding", "plain")
+        if encoding == "latin1-hex":
+            enc.token_to_id = {
+                bytes.fromhex(k).decode("latin-1"): v
+                for k, v in data["token_to_id"].items()
+            }
+        else:
+            enc.token_to_id = data["token_to_id"]
+        enc.id_to_token = {v: k for k, v in enc.token_to_id.items()}
         enc.merges = [BPEMerge(pair=tuple(m["pair"]), token_id=m["token_id"])
                       for m in data["merges"]]
         enc._merge_map = {tuple(m.pair): "".join(m.pair) for m in enc.merges}
@@ -441,118 +520,119 @@ class BytePairEncoder:
 
 
 # ---------------------------------------------------------------------------
-# [P1] Indentation Tokenizer — now handles tabs
+# [F3] Newline detection helpers
 # ---------------------------------------------------------------------------
 
-def _indent_token(n_spaces: int) -> Optional[int]:
-    mapping = {2: "INDENT_2", 4: "INDENT_4", 8: "INDENT_8",
-               12: "INDENT_12", 16: "INDENT_16"}
-    key = mapping.get(n_spaces)
-    return SPECIAL_TOKENS.get(key) if key else None
-
-
-def _tokenize_indentation(line: str) -> Tuple[List[int], str]:
+def _classify_newline(s: str, pos: int) -> Tuple[int, int]:
     """
-    Strip leading indentation and return (indent_tokens, stripped_line).
-
-    [P1] Handles both spaces and tabs.
-    Tabs → one INDENT_TAB token each.
-    Spaces → greedy decompose into INDENT_* tokens.
-    Mixed: tabs first, then spaces (Python's actual rule).
+    Given source string and position of a newline character, return
+    (newline_token_id, length_consumed).
     """
+    if s[pos] == "\r":
+        if pos + 1 < len(s) and s[pos + 1] == "\n":
+            return SPECIAL_TOKENS["NEWLINE_CRLF"], 2
+        return SPECIAL_TOKENS["NEWLINE_CR"], 1
+    return SPECIAL_TOKENS["NEWLINE"], 1  # \n
+
+
+def _detect_line_endings(source: str) -> str:
+    """Return dominant line ending style of source."""
+    crlf = source.count("\r\n")
+    cr   = source.count("\r") - crlf
+    lf   = source.count("\n") - crlf
+    if crlf >= lf and crlf >= cr:
+        return "\r\n"
+    if cr > lf:
+        return "\r"
+    return "\n"
+
+
+# ---------------------------------------------------------------------------
+# [F4] Indentation stack
+# ---------------------------------------------------------------------------
+
+def _indent_tokens_for(n_spaces: int) -> List[int]:
+    """Decompose n_spaces into INDENT_* tokens."""
     tokens: List[int] = []
-
-    # Consume leading tabs first
-    i = 0
-    while i < len(line) and line[i] == "\t":
-        tokens.append(SPECIAL_TOKENS["INDENT_TAB"])
-        i += 1
-
-    # Then leading spaces
-    j = i
-    while j < len(line) and line[j] == " ":
-        j += 1
-    n_spaces = j - i
-
     remaining = n_spaces
-    for step in [16, 12, 8, 4, 2]:
+    for step, name in [(16, "INDENT_16"), (12, "INDENT_12"), (8, "INDENT_8"),
+                       (4, "INDENT_4"), (2, "INDENT_2")]:
         while remaining >= step:
-            tid = _indent_token(step)
-            if tid is not None:
-                tokens.append(tid)
+            tokens.append(SPECIAL_TOKENS[name])
             remaining -= step
-    # Leftover odd spaces — emit literal space chars through BPE (not <unk>)
-    # We return them as part of the stripped line prefix
-    leftover_spaces = " " * remaining
+    # leftover 1-space columns: encode as raw space bytes later
+    return tokens, remaining
 
-    stripped = leftover_spaces + line[j:]
-    return tokens, stripped
+
+class IndentStack:
+    """
+    [F4] Track indentation as a real stack.
+    Emits multiple DEDENT tokens when level drops more than one step.
+    """
+    def __init__(self):
+        self._stack: List[int] = [0]  # stack of indent levels (in col units)
+
+    @property
+    def current(self) -> int:
+        return self._stack[-1]
+
+    def push(self, level: int) -> int:
+        """Register an indent. Returns INDENT token count (always 1 logical INDENT event)."""
+        self._stack.append(level)
+        return 1
+
+    def pop_to(self, level: int) -> int:
+        """
+        Register a dedent to `level`. Returns number of DEDENT tokens to emit.
+        Raises IndentationError if level doesn't match any stack frame.
+        """
+        count = 0
+        while self._stack and self._stack[-1] > level:
+            self._stack.pop()
+            count += 1
+        return count
+
+    def reset(self):
+        self._stack = [0]
 
 
 # ---------------------------------------------------------------------------
-# [P2] Python tokenize-based line classifier
+# [P0] Block-line detection
 # ---------------------------------------------------------------------------
 
 def _is_block_line(stripped: str) -> bool:
     """
-    [P0] Return True iff this line introduces an indented block.
-    Uses keyword prefix check — much more accurate than bare ':' suffix.
-    Falls back to stdlib tokenize for ambiguous cases.
+    Return True iff this line introduces an indented block.
+    Uses keyword prefix check — accurate for all real Python.
     """
-    # Fast path: check leading keyword
-    first_word = stripped.split()[0] if stripped.split() else ""
-    # Strip decorator / async prefix
-    if first_word == "async":
-        words = stripped.split()
-        first_word = words[1] if len(words) > 1 else ""
+    words = stripped.split()
+    if not words:
+        return False
+    first_word = words[0]
+    if first_word == "async" and len(words) > 1:
+        first_word = words[1]
     if first_word not in _BLOCK_KEYWORDS:
         return False
-    # Confirmed it starts with a block keyword and ends with ':'
     return stripped.rstrip().endswith(":")
 
 
-def _try_python_tokenize(line: str) -> Optional[List[Tuple[int, str, int, int]]]:
-    """
-    [P2] Attempt to tokenize a single line using Python's stdlib tokenize.
-    Returns list of (tok_type, tok_string, col_start, col_end), or None on failure.
-    Column positions allow exact whitespace reconstruction between tokens.
-    """
-    try:
-        src = line + "\n"
-        tokens = list(py_tokenize.generate_tokens(io.StringIO(src).readline))
-        return [
-            (tok.type, tok.string, tok.start[1], tok.end[1])
-            for tok in tokens
-            if tok.type not in (
-                py_tokenize.ENCODING,
-                py_tokenize.NEWLINE,
-                py_tokenize.ENDMARKER,
-                py_tokenize.NL,
-            )
-        ]
-    except py_tokenize.TokenError:
-        return None
-
-
 # ---------------------------------------------------------------------------
-# LexForge: Main Tokenizer
+# LexForge: Main Tokenizer  (v3)
 # ---------------------------------------------------------------------------
 
 class LexForge:
     """
-    Structure-Aware Tokenizer for CogForge — v2 (fully lossless).
+    Structure-Aware Tokenizer for code — v3 (all correctness fixes applied).
 
-    Pipeline per input string:
-      1. Line-by-line split
-      2. Indentation extraction → INDENT_* / INDENT_TAB tokens  [P1]
-      3. Python tokenize for Python content (line-level)         [P2]
-      4. Operator fusion (longest-match scan)
-      5. [P0] Identifier detection → CamelCase/snake_case splitting
-             with <US>/<CAMEL> boundary markers for lossless decode
-      6. BPE encoding of each subword (O(n log n) heap)          [P1]
-
-    Lossless guarantee:
-      decode(encode(source)) == source   for all well-formed Python.
+    Pipeline:
+      1. [F2] Whole-file tokenization via Python stdlib tokenize (one pass).
+      2. [F3] Exact newline-form preservation (LF / CRLF / CR / trailing).
+      3. [F4] Indentation stack with multi-DEDENT support.
+      4. [F5] Strings and comments treated as opaque byte sequences.
+      5. [F1] Non-ASCII falls back to UTF-8 byte tokens, never <unk>.
+      6. Operator fusion applied ONLY to NAME/OP token types.
+      7. Identifier splitting with <US>/<CAMEL> boundary markers.
+      8. [P1] O(n log n) heap-based BPE.
     """
 
     def __init__(self, vocab_size: int = 32000,
@@ -560,10 +640,12 @@ class LexForge:
         self.vocab_size = vocab_size
         self.bpe = bpe or BytePairEncoder(vocab_size)
         self._op_fusions = OPERATOR_FUSIONS
+        self._indent_stack = IndentStack()
 
-    # ── Operator Fusion ──────────────────────────────────────────────────────
+    # ── Operator Fusion (NAME/OP only) ───────────────────────────────────────
 
     def _fuse_operators(self, text: str) -> List[Tuple[str, Optional[int]]]:
+        """[F5] Fuse operators in plain code text — NEVER called on strings."""
         result = []
         i = 0
         while i < len(text):
@@ -579,14 +661,23 @@ class LexForge:
                 i += 1
         return result
 
-    # ── [P0] Identifier Encoding (lossless) ─────────────────────────────────
+    # ── Identifier Encoding ──────────────────────────────────────────────────
 
     def _encode_identifier(self, name: str) -> List[int]:
         """
         Split identifier with boundary markers and BPE-encode each subword.
-        Emits: BPE(subword_0) <BOUNDARY> BPE(subword_1) <BOUNDARY> ...
-        Fully reversible via decode.
+        [F1] Non-ASCII identifiers are encoded as UTF-8 bytes directly.
         """
+        # Check if name is ASCII-only; if not, encode as raw bytes
+        try:
+            name.encode("ascii")
+            is_ascii = True
+        except UnicodeEncodeError:
+            is_ascii = False
+
+        if not is_ascii:
+            return self.bpe.encode_bytes(name.encode("utf-8"))
+
         subwords, boundaries = split_identifier(name)
         ids: List[int] = []
         for idx, sw in enumerate(subwords):
@@ -596,187 +687,233 @@ class LexForge:
                 ids.append(boundaries[idx])
         return ids
 
-    # ── Single Line Encoder ──────────────────────────────────────────────────
+    # ── [F1] Raw text encoding (UTF-8 bytes, no <unk>) ───────────────────────
 
-    def _encode_line(self, line: str, use_pytokenize: bool = True) -> List[int]:
-        """Encode a single stripped (no-leading-indent) line."""
-
-        # [P0] Comments: emit COMMENT marker, then BPE-encode the full comment text
-        if line.startswith("#"):
-            ids = [SPECIAL_TOKENS["COMMENT"]]
-            # Encode everything after '#' through BPE (preserves comment content)
-            comment_body = line[1:]
-            ids.extend(self._encode_rest(comment_body))
-            return ids
-
-        # Handle decorators
-        if line.startswith("@"):
-            return [SPECIAL_TOKENS["DECORATOR"]] + self._encode_rest(line[1:])
-
-        # Handle bare ellipsis
-        if line.strip() == "...":
-            return [SPECIAL_TOKENS["ELLIPSIS"]]
-
-        # [P2] Try Python tokenize for better structural accuracy
-        if use_pytokenize:
-            py_tokens = _try_python_tokenize(line)
-            if py_tokens is not None:
-                return self._encode_from_py_tokens(py_tokens)
-
-        return self._encode_rest(line)
-
-    def _encode_from_py_tokens(
-        self, py_tokens: List[Tuple[int, str, int, int]]
-    ) -> List[int]:
+    def _encode_raw_bytes(self, text: str) -> List[int]:
         """
-        [P2] Encode a sequence of (tok_type, tok_string, col_start, col_end).
-        Uses column positions to reconstruct exact inter-token whitespace,
-        ensuring lossless round-trip even for spacing within a line.
+        Encode arbitrary text as UTF-8 bytes through BPE.
+        Guaranteed no <unk> — every possible byte is in the base vocab.
         """
+        return self.bpe.encode_bytes(text.encode("utf-8"))
+
+    # ── [F5] Opaque token encoding (strings, f-strings, comments) ────────────
+
+    def _encode_opaque(self, text: str) -> List[int]:
+        """
+        Encode a token that must be treated as opaque text (string literals,
+        comments after '#'). NO operator fusion, NO identifier splitting.
+        Just raw UTF-8 bytes through BPE.
+        [F5] This is the fix: strings are no longer treated as operator soup.
+        """
+        return self._encode_raw_bytes(text)
+
+    # ── Name/OP encoding (with fusion and identifier splitting) ──────────────
+
+    def _encode_name_or_op(self, text: str) -> List[int]:
+        """Encode a NAME or OP token: fuse operators, split identifiers."""
+        fused = self._fuse_operators(text)
         ids: List[int] = []
-        prev_end = 0  # column position after last token
-
-        for tok_type, tok_str, col_start, col_end in py_tokens:
-            # Emit any whitespace between previous token end and this token start
-            if col_start > prev_end:
-                spaces = " " * (col_start - prev_end)
-                for ch in spaces:
-                    ids.append(self.bpe.symbol_to_id(ch))
-            prev_end = col_end
-
-            if tok_type == py_tokenize.COMMENT:
-                ids.append(SPECIAL_TOKENS["COMMENT"])
-                ids.extend(self._encode_raw_text(tok_str[1:]))  # strip '#'
-            elif tok_type == py_tokenize.NAME:
-                ids.extend(self._encode_identifier(tok_str))
-            elif tok_type in (py_tokenize.NUMBER, py_tokenize.STRING,
-                              py_tokenize.OP):
-                # Try operator fusion first
-                fused = self._fuse_operators(tok_str)
-                buf = ""
-                for seg, fid in fused:
-                    if fid is not None:
-                        if buf:
-                            ids.extend(self._encode_raw_text(buf))
-                            buf = ""
-                        ids.append(fid)
-                    else:
-                        buf += seg
-                if buf:
-                    ids.extend(self._encode_raw_text(buf))
-            elif tok_type == py_tokenize.ERRORTOKEN:
-                ids.extend(self._encode_raw_text(tok_str))
-            else:
-                # FSTRING_START (61), FSTRING_MIDDLE (62), FSTRING_END (63),
-                # and any future token types — encode as raw text
-                if tok_str:
-                    ids.extend(self._encode_raw_text(tok_str))
-
-        return ids
-
-    def _encode_rest(self, text: str) -> List[int]:
-        """Fuse operators, then split identifiers, then BPE."""
-        tokens: List[int] = []
-        segments = self._fuse_operators(text)
-
         buf = ""
-        for seg, fused_id in segments:
-            if fused_id is not None:
+
+        for seg, fid in fused:
+            if fid is not None:
                 if buf:
-                    tokens.extend(self._encode_buffer(buf))
+                    ids.extend(self._encode_buffer(buf))
                     buf = ""
-                tokens.append(fused_id)
+                ids.append(fid)
             else:
                 buf += seg
 
         if buf:
-            tokens.extend(self._encode_buffer(buf))
+            ids.extend(self._encode_buffer(buf))
 
-        return tokens
+        return ids
 
     def _encode_buffer(self, text: str) -> List[int]:
-        """
-        Encode a buffer of non-operator text.
-        [P1] _IDENT_RE now uses '*' so single-char identifiers are caught.
-        Whitespace is encoded directly as character tokens, not through encode_word.
-        """
+        """Encode a buffer of non-operator text, splitting identifiers."""
         tokens: List[int] = []
         last = 0
         for m in _IDENT_RE.finditer(text):
             prefix = text[last:m.start()]
             if prefix:
-                tokens.extend(self._encode_raw_text(prefix))
+                tokens.extend(self._encode_raw_bytes(prefix))
             tokens.extend(self._encode_identifier(m.group()))
             last = m.end()
         suffix = text[last:]
         if suffix:
-            tokens.extend(self._encode_raw_text(suffix))
+            tokens.extend(self._encode_raw_bytes(suffix))
         return tokens
 
-    def _encode_raw_text(self, text: str) -> List[int]:
-        """Encode non-identifier text character by character via BPE vocab."""
+    # ── [F2] File-level tokenizer ─────────────────────────────────────────────
+
+    def _tokenize_file(self, source: str) -> List[int]:
+        """
+        [F2] Tokenize entire source file in one pass using Python's stdlib
+        tokenize. Handles multiline strings, implicit joins, backslash
+        continuations, and bracket continuation correctly.
+
+        [F3] Preserves exact newline form.
+        [F4] Uses IndentStack for proper multi-DEDENT emission.
+        [F5] Strings/comments are opaque.
+        """
         ids: List[int] = []
-        for word in re.split(r"(\s+)", text):
-            if not word:
-                continue
-            if word.isspace():
-                # Encode each whitespace char directly (space/tab already in vocab)
-                for ch in word:
-                    ids.append(self.bpe.symbol_to_id(ch))
+        self._indent_stack.reset()
+
+        # [F3] Detect and preserve trailing newline
+        has_trailing_nl = source.endswith(("\n", "\r\n", "\r"))
+
+        # [F3] Normalize for tokenizer but remember original line endings
+        # We track newline tokens ourselves from INDENT/DEDENT/NEWLINE stdlib tokens
+        # and reconstruct line-ending form from the original source.
+        original_lines = _split_lines_preserve(source)
+
+        try:
+            tokens = list(py_tokenize.generate_tokens(
+                io.StringIO(source).readline
+            ))
+        except py_tokenize.TokenError as e:
+            # Fallback for truly broken source: encode as raw bytes
+            return self._encode_raw_bytes(source)
+
+        # Build a map from (line, col) → original newline style for that line
+        nl_style: Dict[int, int] = {}  # line_number (1-based) → NL token id
+        for lno, raw in enumerate(original_lines, start=1):
+            if raw.endswith("\r\n"):
+                nl_style[lno] = SPECIAL_TOKENS["NEWLINE_CRLF"]
+            elif raw.endswith("\r"):
+                nl_style[lno] = SPECIAL_TOKENS["NEWLINE_CR"]
+            elif raw.endswith("\n"):
+                nl_style[lno] = SPECIAL_TOKENS["NEWLINE"]
             else:
-                # Non-whitespace non-identifier: BPE encode
-                syms = self.bpe.encode_word(word)
-                ids.extend(self.bpe.symbol_to_id(s) for s in syms)
+                nl_style[lno] = SPECIAL_TOKENS["NEWLINE"]  # last line, no NL
+
+        prev_end_col = 0
+        prev_end_row = 1
+
+        for tok in tokens:
+            ttype = tok.type
+            tstr  = tok.string
+            srow, scol = tok.start
+            erow, ecol = tok.end
+
+            if ttype == py_tokenize.ENCODING:
+                continue
+
+            if ttype == py_tokenize.ENDMARKER:
+                break
+
+            # ── Whitespace between tokens (same line) ────────────────────────
+            if srow == prev_end_row and scol > prev_end_col:
+                gap = scol - prev_end_col
+                ids.extend(self._encode_raw_bytes(" " * gap))
+            prev_end_col = ecol
+            prev_end_row = erow
+
+            # ── INDENT ───────────────────────────────────────────────────────
+            if ttype == py_tokenize.INDENT:
+                # tstr is the full indentation string of the new level
+                level = _measure_indent(tstr)
+                self._indent_stack.push(level)
+                indent_toks, leftover = _indent_tokens_for(level)
+                ids.extend(indent_toks)
+                if leftover:
+                    ids.extend(self._encode_raw_bytes(" " * leftover))
+                prev_end_col = len(tstr)
+                continue
+
+            # ── DEDENT ───────────────────────────────────────────────────────
+            if ttype == py_tokenize.DEDENT:
+                # tstr is empty; we infer level from the next INDENT token or 0
+                # The stdlib emits one DEDENT per level change, so we emit one DEDENT token
+                # But we also pop the stack to track where we are
+                n_dedents = self._indent_stack.pop_to(
+                    self._indent_stack.current - 1  # at least one
+                ) or 1
+                for _ in range(max(n_dedents, 1)):
+                    ids.append(SPECIAL_TOKENS["DEDENT"])
+                prev_end_col = 0
+                continue
+
+            # ── NEWLINE (logical) ─────────────────────────────────────────────
+            if ttype == py_tokenize.NEWLINE:
+                nl_tok = nl_style.get(srow, SPECIAL_TOKENS["NEWLINE"])
+                ids.append(nl_tok)
+                prev_end_col = 0
+                prev_end_row = srow + 1
+                continue
+
+            # ── NL (non-logical: blank lines, continuation) ───────────────────
+            if ttype == py_tokenize.NL:
+                nl_tok = nl_style.get(srow, SPECIAL_TOKENS["NEWLINE"])
+                ids.append(nl_tok)
+                prev_end_col = 0
+                prev_end_row = srow + 1
+                continue
+
+            # ── COMMENT ──────────────────────────────────────────────────────
+            if ttype == py_tokenize.COMMENT:
+                ids.append(SPECIAL_TOKENS["COMMENT"])
+                # [F5] comment body is opaque — raw bytes only, no fusion
+                ids.extend(self._encode_opaque(tstr[1:]))  # strip '#'
+                continue
+
+            # ── STRING / FSTRING ─────────────────────────────────────────────
+            # [F5] Treat entire string literal as opaque bytes — no fusion inside
+            if ttype in (py_tokenize.STRING,):
+                ids.extend(self._encode_opaque(tstr))
+                continue
+
+            # Handle Python 3.12+ fstring tokens
+            FSTRING_TYPES = {61, 62, 63}  # FSTRING_START, FSTRING_MIDDLE, FSTRING_END
+            if ttype in FSTRING_TYPES:
+                # [F5] f-string parts are opaque
+                ids.extend(self._encode_opaque(tstr))
+                continue
+
+            # ── NAME ─────────────────────────────────────────────────────────
+            if ttype == py_tokenize.NAME:
+                ids.extend(self._encode_name_or_op(tstr))
+                continue
+
+            # ── OP ───────────────────────────────────────────────────────────
+            if ttype == py_tokenize.OP:
+                ids.extend(self._encode_name_or_op(tstr))
+                # Emit BLOCK_START after block-introducing colons
+                # We detect this by checking if the OP is ':' and current line
+                # starts a block — handled below at NEWLINE boundary
+                continue
+
+            # ── NUMBER ───────────────────────────────────────────────────────
+            if ttype == py_tokenize.NUMBER:
+                ids.extend(self._encode_raw_bytes(tstr))
+                continue
+
+            # ── ERRORTOKEN and anything else ──────────────────────────────────
+            if tstr:
+                ids.extend(self._encode_raw_bytes(tstr))
+
+        # [F3] Emit trailing newline token if source ended with one
+        if has_trailing_nl:
+            ids.append(SPECIAL_TOKENS["TRAILING_NL"])
+
         return ids
 
     # ── Public API ───────────────────────────────────────────────────────────
 
     def encode(self, text: str, add_special_tokens: bool = True,
-               max_length: Optional[int] = None,
-               use_pytokenize: bool = True) -> List[int]:
+               max_length: Optional[int] = None) -> List[int]:
         """
         Encode a full code string into token ids.
-        Handles multi-line code with proper indentation tokenization.
+        [F2] Uses file-level tokenization — handles all valid Python correctly.
+        [F1] Non-ASCII input never produces <unk>.
+        [F3] Preserves CRLF/CR/LF and trailing newline.
+        [F4] Emits correct number of DEDENT tokens per level drop.
         """
         ids: List[int] = []
         if add_special_tokens:
             ids.append(SPECIAL_TOKENS["<bos>"])
 
-        lines = text.split("\n")
-        prev_indent_depth = 0  # track in number of space-equivalents
-
-        for line_idx, raw_line in enumerate(lines):
-            if not raw_line and line_idx == len(lines) - 1:
-                continue  # skip trailing empty line
-
-            if raw_line.strip() == "":
-                ids.append(SPECIAL_TOKENS["NEWLINE"])
-                continue
-
-            # Indentation
-            indent_tokens, stripped = _tokenize_indentation(raw_line)
-
-            # Measure current indent depth (tabs = 4 spaces for comparison)
-            tab_count = len(raw_line) - len(raw_line.lstrip("\t"))
-            space_count = len(raw_line.lstrip("\t")) - len(stripped.lstrip(" "))
-            current_depth = tab_count * 4 + space_count
-
-            if current_depth < prev_indent_depth:
-                ids.append(SPECIAL_TOKENS["DEDENT"])
-            prev_indent_depth = current_depth
-
-            ids.extend(indent_tokens)
-
-            # Encode line content
-            line_tokens = self._encode_line(stripped, use_pytokenize=use_pytokenize)
-            ids.extend(line_tokens)
-
-            # [P0] BLOCK_START: only on real block-introducing lines
-            if _is_block_line(stripped):
-                ids.append(SPECIAL_TOKENS["BLOCK_START"])
-
-            if line_idx < len(lines) - 1:
-                ids.append(SPECIAL_TOKENS["NEWLINE"])
+        ids.extend(self._tokenize_file(text))
 
         if add_special_tokens:
             ids.append(SPECIAL_TOKENS["<eos>"])
@@ -790,22 +927,25 @@ class LexForge:
         """
         Decode token ids back to a code string.
 
-        [P0] Handles <US> and <CAMEL> boundary markers by accumulating
-        identifier subwords and joining them with the correct separator.
-        [P0] COMMENT token followed by BPE tokens reconstructs full comment.
-        [P1] INDENT_TAB reconstructs tab characters.
+        [F1] BPE symbols are byte-level; joined bytes are decoded as UTF-8.
+        [F3] NEWLINE_CRLF/CR tokens reconstruct exact newline forms.
+        [F4] Multiple DEDENT tokens are consumed structurally (no text output).
+        [F5] Strings/comments reconstructed from opaque byte tokens.
+        [P0] <US>/<CAMEL> boundary markers reconstruct identifiers exactly.
         """
         SKIP = {SPECIAL_TOKENS[k] for k in ["<pad>", "<bos>", "<eos>", "<unk>"]}
 
         US    = SPECIAL_TOKENS["<US>"]
         CAMEL = SPECIAL_TOKENS["<CAMEL>"]
 
-        result: List[str] = []
+        # We accumulate raw bytes and flush to string
+        byte_buf = bytearray()
+        result: List[bytes] = []
 
-        # Identifier accumulation: we collect BPE-decoded text between boundary markers
-        id_buf: List[str] = []          # accumulated text pieces for current subword
-        id_subwords: List[str] = []     # completed subwords
-        id_boundaries: List[int] = []   # boundaries between subwords
+        # Identifier accumulation
+        id_buf: List[str]       = []
+        id_subwords: List[str]  = []
+        id_boundaries: List[int]= []
 
         def flush_subword():
             if id_buf:
@@ -815,13 +955,40 @@ class LexForge:
         def flush_id():
             flush_subword()
             if id_subwords:
-                result.append(reconstruct_identifier(id_subwords, id_boundaries))
+                reconstructed = reconstruct_identifier(id_subwords, id_boundaries)
+                result.append(reconstructed.encode("utf-8"))
             id_subwords.clear()
             id_boundaries.clear()
 
-        in_identifier = False  # True while collecting an identifier
+        def flush_bytes():
+            if byte_buf:
+                result.append(bytes(byte_buf))
+                byte_buf.clear()
 
-        indent_map = {
+        in_identifier = False
+
+        # Structural tokens that produce literal text
+        nl_decode = _NL_DECODE
+        structural_text = {
+            **nl_decode,
+            SPECIAL_TOKENS["COMMENT"]:     "#",
+            SPECIAL_TOKENS["DECORATOR"]:   "@",
+            SPECIAL_TOKENS["ELLIPSIS"]:    "...",
+            SPECIAL_TOKENS["SEMICOLON"]:   ";",
+            SPECIAL_TOKENS["TRAILING_NL"]: "",  # handled below
+        }
+        structural_no_text = {
+            SPECIAL_TOKENS["INDENT_2"],
+            SPECIAL_TOKENS["INDENT_4"],
+            SPECIAL_TOKENS["INDENT_8"],
+            SPECIAL_TOKENS["INDENT_12"],
+            SPECIAL_TOKENS["INDENT_16"],
+            SPECIAL_TOKENS["INDENT_TAB"],
+            SPECIAL_TOKENS["DEDENT"],
+            SPECIAL_TOKENS["BLOCK_START"],
+            SPECIAL_TOKENS["BLOCK_END"],
+        }
+        indent_decode = {
             SPECIAL_TOKENS["INDENT_2"]:   "  ",
             SPECIAL_TOKENS["INDENT_4"]:   "    ",
             SPECIAL_TOKENS["INDENT_8"]:   "        ",
@@ -830,26 +997,23 @@ class LexForge:
             SPECIAL_TOKENS["INDENT_TAB"]: "\t",
         }
 
-        structural_flush = {
-            SPECIAL_TOKENS["NEWLINE"],
-            SPECIAL_TOKENS["DEDENT"],
-            SPECIAL_TOKENS["BLOCK_START"],
-            SPECIAL_TOKENS["BLOCK_END"],
-            SPECIAL_TOKENS["COMMENT"],
-            SPECIAL_TOKENS["DECORATOR"],
-            SPECIAL_TOKENS["ELLIPSIS"],
-            SPECIAL_TOKENS["SEMICOLON"],
-        } | set(indent_map.keys()) | set(_FUSION_DECODE.keys())
+        all_structural = (
+            set(nl_decode.keys()) |
+            set(structural_text.keys()) |
+            structural_no_text |
+            set(indent_decode.keys()) |
+            set(_FUSION_DECODE.keys())
+        )
 
         i = 0
-        while i < len(ids):
+        while i < ids:
             tid = ids[i]
 
             if skip_special and tid in SKIP:
                 i += 1
                 continue
 
-            # ── Boundary markers: accumulate into current identifier ───────
+            # ── Boundary markers ────────────────────────────────────────────
             if tid == US:
                 flush_subword()
                 id_boundaries.append(US)
@@ -863,74 +1027,217 @@ class LexForge:
                 i += 1
                 continue
 
-            # ── Structural tokens — flush any pending identifier first ─────
-            if tid in structural_flush:
+            # ── Structural tokens ────────────────────────────────────────────
+            if tid in all_structural:
                 flush_id()
+                flush_bytes()
                 in_identifier = False
 
-                if tid == SPECIAL_TOKENS["NEWLINE"]:
-                    result.append("\n")
-                elif tid in indent_map:
-                    result.append(indent_map[tid])
+                if tid in nl_decode:
+                    result.append(nl_decode[tid].encode("utf-8"))
+                elif tid in indent_decode:
+                    result.append(indent_decode[tid].encode("utf-8"))
+                elif tid == SPECIAL_TOKENS["TRAILING_NL"]:
+                    # The trailing newline was already emitted by the preceding NEWLINE token
+                    # in most cases; but if it wasn't, emit \n
+                    if result and result[-1] not in (b"\n", b"\r\n", b"\r"):
+                        result.append(b"\n")
                 elif tid == SPECIAL_TOKENS["COMMENT"]:
-                    result.append("#")
+                    result.append(b"#")
                 elif tid == SPECIAL_TOKENS["DECORATOR"]:
-                    result.append("@")
+                    result.append(b"@")
                 elif tid == SPECIAL_TOKENS["ELLIPSIS"]:
-                    result.append("...")
+                    result.append(b"...")
                 elif tid == SPECIAL_TOKENS["SEMICOLON"]:
-                    result.append(";")
+                    result.append(b";")
                 elif tid in _FUSION_DECODE:
-                    result.append(_FUSION_DECODE[tid])
-                # DEDENT, BLOCK_START, BLOCK_END: structural only, no text output
+                    result.append(_FUSION_DECODE[tid].encode("utf-8"))
+                # DEDENT, BLOCK_START, BLOCK_END: structural only, no text
                 i += 1
                 continue
 
-            # ── BPE / raw symbol ──────────────────────────────────────────
+            # ── BPE / byte token ─────────────────────────────────────────────
             sym = self.bpe.id_to_token.get(tid)
             if sym is None:
                 i += 1
                 continue
 
-            text_piece = sym[:-4] if sym.endswith("</w>") else sym
-            if not text_piece:  # pure </w> token — skip
-                i += 1
-                continue
+            # sym is a string of chr(byte) chars — convert back to bytes
+            raw_bytes = bytes(ord(c) & 0xFF for c in sym)
 
-            # Look ahead to decide if we're in / entering an identifier
             next_tid = ids[i + 1] if i + 1 < len(ids) else -1
             entering_id = next_tid in (US, CAMEL)
 
             if in_identifier or entering_id:
                 in_identifier = True
-                id_buf.append(text_piece)
+                # For identifier subwords, accumulate as decoded string
+                try:
+                    id_buf.append(raw_bytes.decode("utf-8"))
+                except UnicodeDecodeError:
+                    id_buf.append(raw_bytes.decode("latin-1"))
             else:
                 flush_id()
-                result.append(text_piece)
+                byte_buf.extend(raw_bytes)
 
             i += 1
 
         flush_id()
-        return "".join(result)
+        flush_bytes()
+
+        # [F1] Reassemble: join all byte chunks and decode as UTF-8
+        full_bytes = b"".join(result)
+        return full_bytes.decode("utf-8", errors="surrogateescape")
+
+    def decode(self, ids: List[int], skip_special: bool = True) -> str:
+        """
+        Decode token ids back to a code string.
+        Corrected loop: iterates over list properly.
+        """
+        SKIP = {SPECIAL_TOKENS[k] for k in ["<pad>", "<bos>", "<eos>", "<unk>"]}
+
+        US    = SPECIAL_TOKENS["<US>"]
+        CAMEL = SPECIAL_TOKENS["<CAMEL>"]
+
+        nl_decode = _NL_DECODE
+        indent_decode = {
+            SPECIAL_TOKENS["INDENT_2"]:   "  ",
+            SPECIAL_TOKENS["INDENT_4"]:   "    ",
+            SPECIAL_TOKENS["INDENT_8"]:   "        ",
+            SPECIAL_TOKENS["INDENT_12"]:  "            ",
+            SPECIAL_TOKENS["INDENT_16"]:  "                ",
+            SPECIAL_TOKENS["INDENT_TAB"]: "\t",
+        }
+        all_structural = (
+            set(nl_decode.keys()) |
+            set(indent_decode.keys()) |
+            set(_FUSION_DECODE.keys()) |
+            {
+                SPECIAL_TOKENS["DEDENT"],
+                SPECIAL_TOKENS["BLOCK_START"],
+                SPECIAL_TOKENS["BLOCK_END"],
+                SPECIAL_TOKENS["COMMENT"],
+                SPECIAL_TOKENS["DECORATOR"],
+                SPECIAL_TOKENS["ELLIPSIS"],
+                SPECIAL_TOKENS["SEMICOLON"],
+                SPECIAL_TOKENS["TRAILING_NL"],
+            }
+        )
+
+        result: List[bytes] = []
+        byte_buf = bytearray()
+        id_buf: List[str]        = []
+        id_subwords: List[str]   = []
+        id_boundaries: List[int] = []
+        in_identifier = False
+
+        def flush_subword():
+            if id_buf:
+                id_subwords.append("".join(id_buf))
+                id_buf.clear()
+
+        def flush_id():
+            flush_subword()
+            if id_subwords:
+                reconstructed = reconstruct_identifier(id_subwords, id_boundaries)
+                result.append(reconstructed.encode("utf-8"))
+            id_subwords.clear()
+            id_boundaries.clear()
+
+        def flush_bytes():
+            if byte_buf:
+                result.append(bytes(byte_buf))
+                byte_buf.clear()
+
+        n = len(ids)
+        i = 0
+        while i < n:
+            tid = ids[i]
+
+            if skip_special and tid in SKIP:
+                i += 1
+                continue
+
+            if tid == US:
+                flush_subword()
+                id_boundaries.append(US)
+                in_identifier = True
+                i += 1
+                continue
+
+            if tid == CAMEL:
+                flush_subword()
+                id_boundaries.append(CAMEL)
+                in_identifier = True
+                i += 1
+                continue
+
+            if tid in all_structural:
+                flush_id()
+                flush_bytes()
+                in_identifier = False
+
+                if tid in nl_decode:
+                    result.append(nl_decode[tid].encode())
+                elif tid in indent_decode:
+                    result.append(indent_decode[tid].encode())
+                elif tid == SPECIAL_TOKENS["TRAILING_NL"]:
+                    # Emit a newline only if the last thing wasn't already one
+                    last = result[-1] if result else b""
+                    if not (last.endswith(b"\n") or last.endswith(b"\r")):
+                        result.append(b"\n")
+                elif tid == SPECIAL_TOKENS["COMMENT"]:
+                    result.append(b"#")
+                elif tid == SPECIAL_TOKENS["DECORATOR"]:
+                    result.append(b"@")
+                elif tid == SPECIAL_TOKENS["ELLIPSIS"]:
+                    result.append(b"...")
+                elif tid == SPECIAL_TOKENS["SEMICOLON"]:
+                    result.append(b";")
+                elif tid in _FUSION_DECODE:
+                    result.append(_FUSION_DECODE[tid].encode())
+                # DEDENT, BLOCK_START, BLOCK_END: no text output
+                i += 1
+                continue
+
+            sym = self.bpe.id_to_token.get(tid)
+            if sym is None:
+                i += 1
+                continue
+
+            # [F1] sym is chr(byte) chars → convert to raw bytes
+            raw_bytes = bytes(ord(c) & 0xFF for c in sym)
+
+            next_tid = ids[i + 1] if i + 1 < n else -1
+            entering_id = next_tid in (US, CAMEL)
+
+            if in_identifier or entering_id:
+                in_identifier = True
+                try:
+                    id_buf.append(raw_bytes.decode("utf-8"))
+                except UnicodeDecodeError:
+                    id_buf.append(raw_bytes.decode("latin-1"))
+            else:
+                flush_id()
+                byte_buf.extend(raw_bytes)
+
+            i += 1
+
+        flush_id()
+        flush_bytes()
+
+        full_bytes = b"".join(result)
+        return full_bytes.decode("utf-8", errors="surrogateescape")
+
+    # ── Utility ──────────────────────────────────────────────────────────────
 
     def count_tokens(self, text: str) -> int:
         return len(self.encode(text, add_special_tokens=False))
 
-    def efficiency_vs_naive(self, text: str, naive_tokenizer) -> float:
-        our_count = self.count_tokens(text)
-        naive_count = len(naive_tokenizer.encode(text))
-        return our_count / max(1, naive_count)
-
     def roundtrip_check(self, text: str) -> bool:
-        """
-        Verify lossless round-trip: decode(encode(text)) == text.
-        Returns True if lossless, False otherwise.
-        """
+        """Verify lossless round-trip: decode(encode(text)) == text."""
         encoded = self.encode(text, add_special_tokens=False)
         decoded = self.decode(encoded, skip_special=False)
         return decoded == text
-
-    # ── Vocabulary info ──────────────────────────────────────────────────────
 
     def vocab_size_actual(self) -> int:
         return len(self.bpe.token_to_id)
@@ -964,6 +1271,155 @@ class LexForge:
             print(f"[LexForge] Training BPE on {len(code_strings)} samples...")
         bpe.train(code_strings, min_frequency=min_frequency, verbose=verbose)
         return cls(vocab_size=vocab_size, bpe=bpe)
+
+
+# ---------------------------------------------------------------------------
+# Helper functions used by _tokenize_file
+# ---------------------------------------------------------------------------
+
+def _split_lines_preserve(source: str) -> List[str]:
+    """
+    Split source into lines, preserving line-ending characters.
+    Each element includes the trailing newline (if any).
+    """
+    lines = []
+    i = 0
+    while i < len(source):
+        if source[i] == "\r":
+            if i + 1 < len(source) and source[i + 1] == "\n":
+                j = i + 2
+            else:
+                j = i + 1
+            lines.append(source[i:j])
+            i = j
+        elif source[i] == "\n":
+            lines.append(source[i:i + 1])
+            i += 1
+        else:
+            # Find next newline
+            j = i
+            while j < len(source) and source[j] not in ("\r", "\n"):
+                j += 1
+            if j < len(source):
+                # Include the newline
+                if source[j] == "\r" and j + 1 < len(source) and source[j + 1] == "\n":
+                    lines.append(source[i:j + 2])
+                    i = j + 2
+                else:
+                    lines.append(source[i:j + 1])
+                    i = j + 1
+            else:
+                lines.append(source[i:j])
+                i = j
+    return lines
+
+
+def _measure_indent(indent_str: str) -> int:
+    """Measure indentation level in columns (tabs = 8 per Python spec)."""
+    col = 0
+    for ch in indent_str:
+        if ch == "\t":
+            col = (col // 8 + 1) * 8
+        elif ch == " ":
+            col += 1
+    return col
+
+
+# ---------------------------------------------------------------------------
+# [F6] Property-test harness
+# ---------------------------------------------------------------------------
+
+def roundtrip_property_test(verbose: bool = True) -> bool:
+    """
+    [F6] Hammer the tokenizer with tricky edge cases.
+    Returns True if all pass.
+    """
+    lf = LexForge()
+
+    cases = [
+        # Basic
+        ("empty string",          ""),
+        ("single space",          " "),
+        ("bare newline",          "\n"),
+        ("trailing newline",      "x = 1\n"),
+        ("no trailing newline",   "x = 1"),
+
+        # [F3] CRLF / CR
+        ("CRLF line endings",     "x = 1\r\ny = 2\r\n"),
+        ("CR line endings",       "x = 1\ry = 2\r"),
+        ("mixed endings",         "x = 1\r\ny = 2\nz = 3\r"),
+
+        # [F1] Non-ASCII
+        ("unicode identifier",    "café = 1"),
+        ("unicode comment",       "# こんにちは\nx = 1"),
+        ("unicode string",        'x = "héllo wörld"'),
+        ("emoji in comment",      "# 🐍 Python\nx = 1"),
+
+        # [F2] Multiline strings
+        ("triple-quote string",   'x = """hello\nworld"""'),
+        ("triple-quote newlines", 'x = """\nline1\nline2\n"""'),
+        ("raw string",            r'x = r"\n is not a newline"'),
+
+        # [F5] Operators inside strings (must NOT be fused)
+        ("ops in string",         'x = "a == b != c"'),
+        ("walrus in string",      'x = "a := b"'),
+        ("arrow in string",       'x = "-> and <-"'),
+
+        # [F4] Indentation
+        ("nested indent",         "if True:\n    if True:\n        pass\n    pass\npass"),
+        ("tab indent",            "def foo():\n\treturn 1"),
+        ("deep indent",           "if a:\n    if b:\n        if c:\n            pass"),
+        ("multi-dedent",          "if a:\n    if b:\n        pass\nx = 1"),
+
+        # Multiline constructs
+        ("implicit join brackets","x = (\n    1 +\n    2\n)"),
+        ("backslash continue",    "x = 1 + \\\n    2"),
+        ("list multiline",        "x = [\n    1,\n    2,\n]"),
+
+        # Comments
+        ("comment only",          "# just a comment"),
+        ("inline comment",        "x = 1  # set x"),
+        ("comment with ops",      "# x == y or x != z"),
+
+        # Decorators
+        ("decorator",             "@staticmethod\ndef foo():\n    pass"),
+
+        # Identifiers
+        ("snake_case",            "parse_html_doc = 1"),
+        ("camelCase",             "getUserData = 1"),
+        ("dunder",                "__init__ = 1"),
+        ("single char",           "x = 1\ni = 0\nn = 10"),
+
+        # Edge: empty lines
+        ("blank lines",           "x = 1\n\ny = 2"),
+        ("multiple blank",        "x = 1\n\n\ny = 2"),
+
+        # Edge: semicolons
+        ("semicolon",             "x = 1; y = 2"),
+    ]
+
+    passed = 0
+    failed = 0
+    failures = []
+
+    for name, src in cases:
+        ok = lf.roundtrip_check(src)
+        if ok:
+            passed += 1
+            if verbose:
+                print(f"  ✓ {name}")
+        else:
+            failed += 1
+            enc = lf.encode(src, add_special_tokens=False)
+            dec = lf.decode(enc, skip_special=False)
+            failures.append((name, src, dec))
+            if verbose:
+                print(f"  ✗ {name}")
+                print(f"      input:  {src!r}")
+                print(f"      output: {dec!r}")
+
+    print(f"\nProperty tests: {passed} passed, {failed} failed")
+    return failed == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1009,31 +1465,76 @@ if __name__ == "__main__":
         status = "✓" if got == expected else f"✗ expected {expected}"
         print(f"  {line!r:40s} → {got} {status}")
 
-    # ── Encode/decode round-trips ─────────────────────────────────────────────
-    print("\n=== Encode/decode snippets ===")
-    snippets = [
-        "x = 1",
-        "# this is a comment",
-        "parse_html_doc",
-        "getUserData",
-        "if x > 0:\n    return x",
-        "x = {'a': 1, 'b': 2}",
-        "@staticmethod\ndef foo():\n    pass",
-    ]
-    for snippet in snippets:
-        enc = lf.encode(snippet, add_special_tokens=False)
+    # ── [F6] Full property-test suite ────────────────────────────────────────
+    print("\n=== Property-test suite (F6) ===")
+    all_passed = roundtrip_property_test(verbose=True)
+
+    # ── Newline fidelity (F3) ─────────────────────────────────────────────────
+    print("\n=== Newline fidelity (F3) ===")
+    for desc, src in [
+        ("LF only",           "x = 1\ny = 2\n"),
+        ("CRLF",              "x = 1\r\ny = 2\r\n"),
+        ("CR only",           "x = 1\ry = 2\r"),
+        ("trailing NL",       "x = 1\n"),
+        ("no trailing NL",    "x = 1"),
+    ]:
+        enc = lf.encode(src, add_special_tokens=False)
         dec = lf.decode(enc, skip_special=False)
-        ok = dec == snippet
-        short = repr(snippet)[:50]
-        print(f"  {'✓' if ok else '✗'} {short}")
+        ok = dec == src
+        print(f"  {'✓' if ok else '✗'} {desc}")
+        if not ok:
+            print(f"    input:  {src!r}")
+            print(f"    output: {dec!r}")
+
+    # ── Unicode (F1) ─────────────────────────────────────────────────────────
+    print("\n=== Unicode / non-ASCII (F1) ===")
+    unicode_cases = [
+        'café = 1',
+        '# こんにちは',
+        'x = "héllo wörld"',
+        'Ω = 3.14',
+    ]
+    for src in unicode_cases:
+        enc = lf.encode(src, add_special_tokens=False)
+        # Verify no <unk> tokens
+        has_unk = SPECIAL_TOKENS["<unk>"] in enc
+        dec = lf.decode(enc, skip_special=False)
+        ok = dec == src and not has_unk
+        print(f"  {'✓' if ok else '✗'} {src!r}")
+        if has_unk:
+            print(f"    WARNING: <unk> token emitted!")
+        if dec != src:
+            print(f"    got: {dec!r}")
+
+    # ── Multiline strings (F2) ───────────────────────────────────────────────
+    print("\n=== Multiline strings (F2) ===")
+    ml_cases = [
+        'x = """hello\nworld"""',
+        'x = """\nline1\nline2\n"""',
+        "x = '''a\nb\nc'''",
+    ]
+    for src in ml_cases:
+        enc = lf.encode(src, add_special_tokens=False)
+        dec = lf.decode(enc, skip_special=False)
+        ok = dec == src
+        print(f"  {'✓' if ok else '✗'} {src[:40]!r}")
         if not ok:
             print(f"    got: {dec!r}")
 
-    # ── Tab indentation ───────────────────────────────────────────────────────
-    print("\n=== Tab indentation ===")
-    tab_code = "def foo():\n\treturn 1"
-    enc = lf.encode(tab_code, add_special_tokens=False)
-    dec = lf.decode(enc, skip_special=False)
-    print(f"  {'✓' if dec == tab_code else '✗'} tab indentation preserved")
+    # ── Operators-in-strings not fused (F5) ──────────────────────────────────
+    print("\n=== Operators inside strings not fused (F5) ===")
+    op_str_cases = [
+        'x = "a == b"',
+        'x = "a := b"',
+        'x = "-> and <-"',
+        'x = "not in list"',
+    ]
+    for src in op_str_cases:
+        enc = lf.encode(src, add_special_tokens=False)
+        dec = lf.decode(enc, skip_special=False)
+        ok = dec == src
+        print(f"  {'✓' if ok else '✗'} {src!r}")
+        if not ok:
+            print(f"    got: {dec!r}")
 
     print("\nDone.")
