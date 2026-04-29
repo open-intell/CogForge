@@ -1,4 +1,3 @@
-infernece.py
 """
 CogForge — inference.py
 ========================
