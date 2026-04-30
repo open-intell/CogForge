@@ -31,8 +31,8 @@ from torch.optim import AdamW
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-from model.architecture import CogForge, CogForgeConfig
-from model.losses import CogForgeLoss, LossWeights
+from Architecture import CogForge, CogForgeConfig
+from Loss import CogForgeLoss, LossWeights
 
 
 # ---------------------------------------------------------------------------

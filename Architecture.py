@@ -1072,6 +1072,28 @@ class LatentCommsCoordinator:
         _, hardness = self.curriculum.current
         return self.router(z_stack, hardness=hardness)
 
+    def send(self, source: str, target: str, message: str) -> None:
+        """
+        Control-plane message broadcast between agents.
+        Registers both agents if needed and stores a deterministic latent
+        vector derived from the message in the z_buffer for routing.
+        Used by CAPSController for phase-transition signalling.
+        """
+        if source not in self._channels:
+            self.register(source)
+        if target not in self._channels:
+            self.register(target)
+        # Derive a deterministic latent vector from the message text
+        # so the control-plane signal is still routable.
+        msg_hash = int(hashlib.sha256(message.encode()).hexdigest(), 16)
+        Lc = self.config.latent_comm_dim
+        vec = torch.zeros(Lc)
+        for i in range(Lc):
+            seed = msg_hash + i
+            vec[i] = ((seed * 2654435761) % (2**32)) / (2**32) - 0.5
+        vec = vec / (vec.norm().clamp(min=1e-6))
+        self._z_buffer[source] = vec
+
     def curriculum_step(self) -> Tuple[float, float]:
         return self.curriculum.step()
 
@@ -6548,7 +6570,7 @@ class CogWorksSwarm:
         # CAPSSearchLoop: patch-plan MCTS with PUCT + robust_value
         self.caps_search = CAPSSearchLoop(
             verification_loop=self.caps_verify,
-            beam_expansion=self.cog_search_engine.beam,
+            beam_expansion=self.cog_search_engine.beam_expansion,
             config=self.config,
             exploration_c=1.414,
             k_expansions=3,
@@ -7260,7 +7282,7 @@ if __name__ == "__main__":
     print("\n--- CAPSSearchLoop (patch-plan MCTS) ---")
     caps_search = CAPSSearchLoop(
         verification_loop=caps_verify,
-        beam_expansion=swarm.cog_search_engine.beam,
+        beam_expansion=swarm.cog_search_engine.beam_expansion,
         config=cfg,
         k_expansions=2,
     )

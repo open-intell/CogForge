@@ -551,7 +551,7 @@ def _detect_line_endings(source: str) -> str:
 # [F4] Indentation stack
 # ---------------------------------------------------------------------------
 
-def _indent_tokens_for(n_spaces: int) -> List[int]:
+def _indent_tokens_for(n_spaces: int) -> Tuple[List[int], int]:
     """Decompose n_spaces into INDENT_* tokens."""
     tokens: List[int] = []
     remaining = n_spaces
@@ -789,6 +789,7 @@ class LexForge:
 
         prev_end_col = 0
         prev_end_row = 1
+        last_nl_idx = None  # [F3] track last NEWLINE/NL index for trailing-NL fix
 
         for tok in tokens:
             ttype = tok.type
@@ -802,22 +803,86 @@ class LexForge:
             if ttype == py_tokenize.ENDMARKER:
                 break
 
-            # ── Whitespace between tokens (same line) ────────────────────────
-            if srow == prev_end_row and scol > prev_end_col:
+            # ── Content between tokens ────────────────────────────────────────
+            # DEDENT tokens have their position at the indent level, not at
+            # actual content — skip gap computation for them entirely.
+            if ttype == py_tokenize.DEDENT:
+                pass  # DEDENT handler below will reset prev_end_col
+            elif (srow > prev_end_row
+                  and ttype not in (py_tokenize.NEWLINE, py_tokenize.NL,
+                                    py_tokenize.INDENT)):
+                # Cross-line gap without NEWLINE/NL → backslash continuation.
+                # Python's tokenizer joins backslash-continued lines into one
+                # logical line, discarding the backslash, newline, and
+                # continuation indentation.  Re-emit them here.
+                for line_no in range(prev_end_row, srow):
+                    line_idx = line_no - 1
+                    if 0 <= line_idx < len(original_lines):
+                        line = original_lines[line_idx]
+                        start_col = (prev_end_col
+                                     if line_no == prev_end_row else 0)
+                        content = line[start_col:]
+                        # Strip line ending (emitted as NEWLINE token)
+                        if content.endswith('\r\n'):
+                            content = content[:-2]
+                        elif content.endswith('\n'):
+                            content = content[:-1]
+                        elif content.endswith('\r'):
+                            content = content[:-1]
+                        if content:
+                            ids.extend(self._encode_raw_bytes(content))
+                        nl_tok = nl_style.get(line_no,
+                                              SPECIAL_TOKENS["NEWLINE"])
+                        ids.append(nl_tok)
+                # Continuation indentation
+                if scol > 0:
+                    cont_idx = srow - 1
+                    if 0 <= cont_idx < len(original_lines):
+                        indent_str = original_lines[cont_idx][:scol]
+                    else:
+                        indent_str = " " * scol
+                    ids.extend(self._encode_raw_bytes(indent_str))
+                prev_end_col = ecol
+                prev_end_row = erow
+            elif srow == prev_end_row and scol > prev_end_col:
                 gap = scol - prev_end_col
                 ids.extend(self._encode_raw_bytes(" " * gap))
-            prev_end_col = ecol
-            prev_end_row = erow
+                prev_end_col = ecol
+                prev_end_row = erow
+            else:
+                prev_end_col = ecol
+                prev_end_row = erow
 
             # ── INDENT ───────────────────────────────────────────────────────
             if ttype == py_tokenize.INDENT:
                 # tstr is the full indentation string of the new level
                 level = _measure_indent(tstr)
                 self._indent_stack.push(level)
-                indent_toks, leftover = _indent_tokens_for(level)
-                ids.extend(indent_toks)
-                if leftover:
-                    ids.extend(self._encode_raw_bytes(" " * leftover))
+                # [Bug3 fix] Encode the *actual* indentation characters
+                # (tabs vs spaces) instead of converting everything to
+                # space-based column counts.
+                indent_ids: List[int] = []
+                space_count = 0
+                for ch in tstr:
+                    if ch == '\t':
+                        # Flush accumulated spaces first
+                        if space_count > 0:
+                            sp_toks, leftover = _indent_tokens_for(space_count)
+                            indent_ids.extend(sp_toks)
+                            if leftover:
+                                indent_ids.extend(
+                                    self._encode_raw_bytes(" " * leftover))
+                            space_count = 0
+                        indent_ids.append(SPECIAL_TOKENS["INDENT_TAB"])
+                    else:
+                        space_count += 1
+                if space_count > 0:
+                    sp_toks, leftover = _indent_tokens_for(space_count)
+                    indent_ids.extend(sp_toks)
+                    if leftover:
+                        indent_ids.extend(
+                            self._encode_raw_bytes(" " * leftover))
+                ids.extend(indent_ids)
                 prev_end_col = len(tstr)
                 continue
 
@@ -838,6 +903,7 @@ class LexForge:
             if ttype == py_tokenize.NEWLINE:
                 nl_tok = nl_style.get(srow, SPECIAL_TOKENS["NEWLINE"])
                 ids.append(nl_tok)
+                last_nl_idx = len(ids) - 1  # [F3] track for trailing-NL fix
                 prev_end_col = 0
                 prev_end_row = srow + 1
                 continue
@@ -846,6 +912,7 @@ class LexForge:
             if ttype == py_tokenize.NL:
                 nl_tok = nl_style.get(srow, SPECIAL_TOKENS["NEWLINE"])
                 ids.append(nl_tok)
+                last_nl_idx = len(ids) - 1  # [F3] track for trailing-NL fix
                 prev_end_col = 0
                 prev_end_row = srow + 1
                 continue
@@ -895,6 +962,12 @@ class LexForge:
         # [F3] Emit trailing newline token if source ended with one
         if has_trailing_nl:
             ids.append(SPECIAL_TOKENS["TRAILING_NL"])
+        else:
+            # [F3 fix] Python's tokenize always emits NEWLINE for the last
+            # logical line even when the source has no trailing newline.
+            # Remove that spurious NEWLINE/NL to preserve lossless round-trip.
+            if last_nl_idx is not None:
+                ids.pop(last_nl_idx)
 
         return ids
 
@@ -926,172 +999,13 @@ class LexForge:
     def decode(self, ids: List[int], skip_special: bool = True) -> str:
         """
         Decode token ids back to a code string.
+        Corrected loop: iterates over list properly.
 
         [F1] BPE symbols are byte-level; joined bytes are decoded as UTF-8.
         [F3] NEWLINE_CRLF/CR tokens reconstruct exact newline forms.
         [F4] Multiple DEDENT tokens are consumed structurally (no text output).
         [F5] Strings/comments reconstructed from opaque byte tokens.
         [P0] <US>/<CAMEL> boundary markers reconstruct identifiers exactly.
-        """
-        SKIP = {SPECIAL_TOKENS[k] for k in ["<pad>", "<bos>", "<eos>", "<unk>"]}
-
-        US    = SPECIAL_TOKENS["<US>"]
-        CAMEL = SPECIAL_TOKENS["<CAMEL>"]
-
-        # We accumulate raw bytes and flush to string
-        byte_buf = bytearray()
-        result: List[bytes] = []
-
-        # Identifier accumulation
-        id_buf: List[str]       = []
-        id_subwords: List[str]  = []
-        id_boundaries: List[int]= []
-
-        def flush_subword():
-            if id_buf:
-                id_subwords.append("".join(id_buf))
-                id_buf.clear()
-
-        def flush_id():
-            flush_subword()
-            if id_subwords:
-                reconstructed = reconstruct_identifier(id_subwords, id_boundaries)
-                result.append(reconstructed.encode("utf-8"))
-            id_subwords.clear()
-            id_boundaries.clear()
-
-        def flush_bytes():
-            if byte_buf:
-                result.append(bytes(byte_buf))
-                byte_buf.clear()
-
-        in_identifier = False
-
-        # Structural tokens that produce literal text
-        nl_decode = _NL_DECODE
-        structural_text = {
-            **nl_decode,
-            SPECIAL_TOKENS["COMMENT"]:     "#",
-            SPECIAL_TOKENS["DECORATOR"]:   "@",
-            SPECIAL_TOKENS["ELLIPSIS"]:    "...",
-            SPECIAL_TOKENS["SEMICOLON"]:   ";",
-            SPECIAL_TOKENS["TRAILING_NL"]: "",  # handled below
-        }
-        structural_no_text = {
-            SPECIAL_TOKENS["INDENT_2"],
-            SPECIAL_TOKENS["INDENT_4"],
-            SPECIAL_TOKENS["INDENT_8"],
-            SPECIAL_TOKENS["INDENT_12"],
-            SPECIAL_TOKENS["INDENT_16"],
-            SPECIAL_TOKENS["INDENT_TAB"],
-            SPECIAL_TOKENS["DEDENT"],
-            SPECIAL_TOKENS["BLOCK_START"],
-            SPECIAL_TOKENS["BLOCK_END"],
-        }
-        indent_decode = {
-            SPECIAL_TOKENS["INDENT_2"]:   "  ",
-            SPECIAL_TOKENS["INDENT_4"]:   "    ",
-            SPECIAL_TOKENS["INDENT_8"]:   "        ",
-            SPECIAL_TOKENS["INDENT_12"]:  "            ",
-            SPECIAL_TOKENS["INDENT_16"]:  "                ",
-            SPECIAL_TOKENS["INDENT_TAB"]: "\t",
-        }
-
-        all_structural = (
-            set(nl_decode.keys()) |
-            set(structural_text.keys()) |
-            structural_no_text |
-            set(indent_decode.keys()) |
-            set(_FUSION_DECODE.keys())
-        )
-
-        i = 0
-        while i < ids:
-            tid = ids[i]
-
-            if skip_special and tid in SKIP:
-                i += 1
-                continue
-
-            # ── Boundary markers ────────────────────────────────────────────
-            if tid == US:
-                flush_subword()
-                id_boundaries.append(US)
-                in_identifier = True
-                i += 1
-                continue
-            if tid == CAMEL:
-                flush_subword()
-                id_boundaries.append(CAMEL)
-                in_identifier = True
-                i += 1
-                continue
-
-            # ── Structural tokens ────────────────────────────────────────────
-            if tid in all_structural:
-                flush_id()
-                flush_bytes()
-                in_identifier = False
-
-                if tid in nl_decode:
-                    result.append(nl_decode[tid].encode("utf-8"))
-                elif tid in indent_decode:
-                    result.append(indent_decode[tid].encode("utf-8"))
-                elif tid == SPECIAL_TOKENS["TRAILING_NL"]:
-                    # The trailing newline was already emitted by the preceding NEWLINE token
-                    # in most cases; but if it wasn't, emit \n
-                    if result and result[-1] not in (b"\n", b"\r\n", b"\r"):
-                        result.append(b"\n")
-                elif tid == SPECIAL_TOKENS["COMMENT"]:
-                    result.append(b"#")
-                elif tid == SPECIAL_TOKENS["DECORATOR"]:
-                    result.append(b"@")
-                elif tid == SPECIAL_TOKENS["ELLIPSIS"]:
-                    result.append(b"...")
-                elif tid == SPECIAL_TOKENS["SEMICOLON"]:
-                    result.append(b";")
-                elif tid in _FUSION_DECODE:
-                    result.append(_FUSION_DECODE[tid].encode("utf-8"))
-                # DEDENT, BLOCK_START, BLOCK_END: structural only, no text
-                i += 1
-                continue
-
-            # ── BPE / byte token ─────────────────────────────────────────────
-            sym = self.bpe.id_to_token.get(tid)
-            if sym is None:
-                i += 1
-                continue
-
-            # sym is a string of chr(byte) chars — convert back to bytes
-            raw_bytes = bytes(ord(c) & 0xFF for c in sym)
-
-            next_tid = ids[i + 1] if i + 1 < len(ids) else -1
-            entering_id = next_tid in (US, CAMEL)
-
-            if in_identifier or entering_id:
-                in_identifier = True
-                # For identifier subwords, accumulate as decoded string
-                try:
-                    id_buf.append(raw_bytes.decode("utf-8"))
-                except UnicodeDecodeError:
-                    id_buf.append(raw_bytes.decode("latin-1"))
-            else:
-                flush_id()
-                byte_buf.extend(raw_bytes)
-
-            i += 1
-
-        flush_id()
-        flush_bytes()
-
-        # [F1] Reassemble: join all byte chunks and decode as UTF-8
-        full_bytes = b"".join(result)
-        return full_bytes.decode("utf-8", errors="surrogateescape")
-
-    def decode(self, ids: List[int], skip_special: bool = True) -> str:
-        """
-        Decode token ids back to a code string.
-        Corrected loop: iterates over list properly.
         """
         SKIP = {SPECIAL_TOKENS[k] for k in ["<pad>", "<bos>", "<eos>", "<unk>"]}
 
@@ -1158,6 +1072,16 @@ class LexForge:
                 continue
 
             if tid == US:
+                # [Bug2 fix] byte_buf may contain bytes from the subword
+                # *before* this boundary (the first subword's bytes went to
+                # byte_buf because in_identifier was False).  Transfer them.
+                if byte_buf:
+                    try:
+                        id_buf.insert(0, bytes(byte_buf).decode("utf-8",
+                                     errors="surrogateescape"))
+                    except Exception:
+                        id_buf.insert(0, bytes(byte_buf).decode("latin-1"))
+                    byte_buf.clear()
                 flush_subword()
                 id_boundaries.append(US)
                 in_identifier = True
@@ -1165,6 +1089,14 @@ class LexForge:
                 continue
 
             if tid == CAMEL:
+                # [Bug2 fix] same transfer as US
+                if byte_buf:
+                    try:
+                        id_buf.insert(0, bytes(byte_buf).decode("utf-8",
+                                     errors="surrogateescape"))
+                    except Exception:
+                        id_buf.insert(0, bytes(byte_buf).decode("latin-1"))
+                    byte_buf.clear()
                 flush_subword()
                 id_boundaries.append(CAMEL)
                 in_identifier = True
@@ -1210,7 +1142,29 @@ class LexForge:
             next_tid = ids[i + 1] if i + 1 < n else -1
             entering_id = next_tid in (US, CAMEL)
 
-            if in_identifier or entering_id:
+            if in_identifier:
+                # [Bug2 fix] Check whether this byte is a valid identifier
+                # character.  If not, the identifier has ended — flush it
+                # before treating the byte as raw content.
+                is_id_byte = all(
+                    0x30 <= b <= 0x39   # 0-9
+                    or 0x41 <= b <= 0x5A  # A-Z
+                    or 0x61 <= b <= 0x7A  # a-z
+                    or b == 0x5F          # _
+                    for b in raw_bytes
+                )
+                if is_id_byte:
+                    try:
+                        id_buf.append(raw_bytes.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        id_buf.append(raw_bytes.decode("latin-1"))
+                else:
+                    # Non-identifier byte terminates the identifier
+                    flush_id()
+                    flush_bytes()
+                    byte_buf.extend(raw_bytes)
+                    in_identifier = False
+            elif entering_id:
                 in_identifier = True
                 try:
                     id_buf.append(raw_bytes.decode("utf-8"))
