@@ -22,9 +22,9 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 import torch
-from model.architecture import CogForgeConfig
-from training.trainer import CogForgeTrainer, TrainingConfig
-from data.dataset import (
+from Architecture import CogForgeConfig
+from trainer import CogForgeTrainer, TrainingConfig
+from pipline import (
     CodeDataset, CodeTokenizer, CogForgeCollator, make_dataloader,
     BugContrastiveDataset
 )

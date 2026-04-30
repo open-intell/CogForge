@@ -15,8 +15,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from model.architecture import CogForge, CogForgeConfig
-from data.dataset import CodeTokenizer
+from Architecture import CogForge, CogForgeConfig
+from pipline import CodeTokenizer
 
 
 def load_model(checkpoint_path: str, device: str = "cpu") -> tuple:
